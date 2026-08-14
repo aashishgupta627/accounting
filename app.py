@@ -7,85 +7,157 @@ import numpy as np
 st.set_page_config(page_title="Invoice JSON Generator", layout="wide")
 
 # --- Helper Functions ---
+def safe_float(value):
+    """Safely convert a value to float, return 0 if not possible."""
+    if pd.isna(value):
+        return 0
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0
+
 def process_invoice_data(file):
     """Reads the Excel file, processes B2B/B2C logic, and builds the JSON."""
     try:
-        # 1. Read the specific sheets
-        df_summary = pd.read_excel(file, sheet_name="Consolidated Summary")
-        df_items = pd.read_excel(file, sheet_name="Item Details")
-        
-        # Strip whitespace from column names just in case
+        # 1. Read Summary sheet (header is in row 0)
+        df_summary = pd.read_excel(file, sheet_name="Consolidated Summary", header=0)
         df_summary.columns = df_summary.columns.str.strip()
-        df_items.columns = df_items.columns.str.strip()
-
-        # Clean NaN values to None for better JSON formatting
         df_summary = df_summary.replace({np.nan: None})
-        df_items = df_items.replace({np.nan: None})
-
+        
+        # 2. Read Item Details sheet (raw, without headers - headers are in rows 3-4)
+        df_items_raw = pd.read_excel(file, sheet_name="Item Details", header=None)
+        
     except ValueError as e:
         st.error(f"Error loading sheets. Please ensure both 'Consolidated Summary' and 'Item Details' exist. Details: {e}")
         return None, None
 
-    # Replace these with your actual column names if they differ
-    INV_KEY_SUMMARY = "Invoice Number"
-    INV_KEY_ITEMS = "Invoice Number"
-    GST_COL = "GST No"
-    TOTAL_BILL_COL = "Total Bill Amount"
-    ITEM_AMOUNT_COL = "Item Amount"
+    # Parse Item Details sheet
+    # Structure: Invoice header rows (with TRN NO.) followed by item detail rows
+    item_invoices = {}
+    current_invoice = None
     
+    for i in range(6, len(df_items_raw)):  # Data starts after header rows
+        row = df_items_raw.iloc[i]
+        trn_no = row[2]
+        amount = row[16]
+        item_name = row[1]
+        
+        # Check if this is an invoice header row (has TRN NO. like S0/999)
+        if pd.notna(trn_no) and isinstance(trn_no, str) and trn_no.startswith('S0/'):
+            current_invoice = trn_no
+            item_invoices[current_invoice] = {
+                'invoice_no_raw': trn_no,
+                'patient_name': row[3] if pd.notna(row[3]) else None,
+                'doctor_name': row[4] if pd.notna(row[4]) else None,
+                'address': row[8] if pd.notna(row[8]) else None,
+                'round_off': safe_float(row[15]),
+                'total_amount': safe_float(amount),
+                'items': []
+            }
+        # Check if this is an item row (has item name, no TRN NO.)
+        elif current_invoice and pd.notna(item_name) and isinstance(item_name, str) and item_name != 'ITEM NAME':
+            item = {
+                'item_code': row[0] if pd.notna(row[0]) else None,
+                'item_name': item_name,
+                'batch': row[2] if pd.notna(row[2]) else None,
+                'expiry': row[5] if pd.notna(row[5]) else None,
+                'pack': row[6] if pd.notna(row[6]) else None,
+                'qty': safe_float(row[7]),
+                'free': safe_float(row[9]),
+                'gst_percent': safe_float(row[10]),
+                'rate': safe_float(row[11]),
+                'amount': safe_float(row[12]),
+                'discount': safe_float(row[13]),
+                'taxable_amount': safe_float(row[14]),
+                'net_amount': safe_float(row[15]),
+                'hsn_code': row[17] if pd.notna(row[17]) else None,
+                'gst_amount': safe_float(row[18]),
+                'cat_dis_percent': safe_float(row[19]),
+                'category': row[20] if pd.notna(row[20]) else None,
+                'inc_srate': safe_float(row[21]),
+                'dis_percent': safe_float(row[22]),
+            }
+            item_invoices[current_invoice]['items'].append(item)
+
+    # Process Summary and match with Item Details
     final_json_data = []
     validation_log = []
 
-    # 2. Iterate over the Consolidated Summary
     for index, row in df_summary.iterrows():
-        invoice_no = row.get(INV_KEY_SUMMARY)
-        if not invoice_no:
+        invoice_no = row.get('INV.NO')
+        
+        # Skip header rows and total/summary rows at the bottom
+        if not invoice_no or invoice_no == 'INV.NO' or str(invoice_no).startswith('Total'):
+            continue
+        
+        # Also skip pure numeric rows (these are summary/total rows)
+        if isinstance(invoice_no, (int, float)):
             continue
             
-        gst_no = row.get(GST_COL)
-        expected_total = float(row.get(TOTAL_BILL_COL, 0.0) or 0.0)
+        gst_no = row.get('GST NO')
+        expected_total = safe_float(row.get('Bill Amt.', 0))
+        party_name = row.get('PARTY NAME')
         
-        # Determine B2B vs B2C logic
-        # If GST No exists and is a string of reasonable length, it's B2B
-        is_b2b = bool(gst_no and isinstance(gst_no, str) and len(gst_no.strip()) > 5)
+        # Determine B2B vs B2C: If GST No exists and is a valid GST string
+        is_b2b = bool(gst_no and isinstance(gst_no, str) and len(str(gst_no).strip()) > 5)
         customer_type = "B2B" if is_b2b else "B2C"
-
-        # Build parent JSON structure
+        
+        # Convert invoice number format to match Item Details
+        # Summary format: S0-26-999 -> Item Details format: S0/999
+        inv_parts = str(invoice_no).split('-')
+        if len(inv_parts) >= 3:
+            item_inv_key = f"S0/{inv_parts[-1]}"
+        else:
+            item_inv_key = invoice_no
+        
+        # Get matching items from Item Details
+        item_data = item_invoices.get(item_inv_key, {})
+        items = item_data.get('items', [])
+        
+        # Calculate sum from items
+        calculated_sum = sum(safe_float(item.get('net_amount', 0)) for item in items)
+        
+        # Validation: Check if calculated sum aligns with summary bill amount
+        # Using a tolerance of 1.0 to account for rounding issues
+        is_valid = abs(calculated_sum - expected_total) <= 1.0
+        
         invoice_record = {
             "invoice_number": invoice_no,
             "customer_type": customer_type,
             "gst_number": gst_no if is_b2b else None,
+            "party_name": party_name,
             "summary_bill_amount": expected_total,
-            "other_summary_details": {k: v for k, v in row.items() if k not in [INV_KEY_SUMMARY, GST_COL, TOTAL_BILL_COL]},
-            "items": []
+            "summary_details": {
+                "inv_date": row.get('INV. DATE'),
+                "party_code": row.get('Party Code'),
+                "rnd_amt": row.get('Rnd Amt'),
+                "other_amt": row.get('Other Amt.'),
+                "gst_5_amt": row.get('GST 5 Amt.'),
+                "cgst_2_5": row.get('CGST 2.5'),
+                "sgst_2_5": row.get('SGST 2.5'),
+                "state_code": row.get('StateCode'),
+            },
+            "items": items,
+            "item_details_meta": {
+                "patient_name": item_data.get('patient_name'),
+                "doctor_name": item_data.get('doctor_name'),
+                "address": item_data.get('address'),
+                "round_off": item_data.get('round_off'),
+                "items_calculated_total": calculated_sum,
+            },
+            "is_validated": is_valid
         }
-
-        # 3. Dive into Item Details sheet
-        matching_items = df_items[df_items[INV_KEY_ITEMS] == invoice_no]
         
-        calculated_sum = 0.0
-        
-        for _, item_row in matching_items.iterrows():
-            item_amount = float(item_row.get(ITEM_AMOUNT_COL, 0.0) or 0.0)
-            calculated_sum += item_amount
-            
-            # Remove the invoice key from the item details to avoid redundancy
-            item_dict = {k: v for k, v in item_row.items() if k != INV_KEY_ITEMS}
-            invoice_record["items"].append(item_dict)
-
-        # 4. Validation: Check if calculated sum aligns with summary bill amount
-        # Using a small tolerance (e.g., 0.01) to account for floating point/rounding issues
-        is_valid = abs(calculated_sum - expected_total) <= 0.01
-        
-        invoice_record["is_validated"] = is_valid
         final_json_data.append(invoice_record)
 
         if not is_valid:
             validation_log.append({
                 "Invoice": invoice_no,
+                "Item Key": item_inv_key,
                 "Summary Total": expected_total,
-                "Items Calculated Sum": calculated_sum,
-                "Difference": round(abs(calculated_sum - expected_total), 2)
+                "Items Calculated Sum": round(calculated_sum, 2),
+                "Difference": round(abs(calculated_sum - expected_total), 2),
+                "Items Count": len(items)
             })
 
     return final_json_data, validation_log
@@ -95,6 +167,10 @@ def process_invoice_data(file):
 st.title("📄 Invoice to JSON Processor")
 st.markdown("""
 This app reads a consolidated summary and item details from an Excel file, applies B2B/B2C logic based on GST presence, validates item totals against the bill amount, and generates a nested JSON file.
+
+**Supported format:** The Excel file must have two sheets:
+1. **Consolidated Summary** - with columns: INV.NO, PARTY NAME, GST NO, Bill Amt., etc.
+2. **Item Details** - with invoice header rows (TRN NO.) followed by item rows
 """)
 
 st.divider()
@@ -109,7 +185,10 @@ if uploaded_file is not None:
         json_data, val_errors = process_invoice_data(uploaded_file)
         
     if json_data is not None:
-        st.success(f"Successfully processed {len(json_data)} invoices!")
+        b2b_count = sum(1 for inv in json_data if inv['customer_type'] == 'B2B')
+        b2c_count = sum(1 for inv in json_data if inv['customer_type'] == 'B2C')
+        
+        st.success(f"Successfully processed {len(json_data)} invoices! (B2B: {b2b_count}, B2C: {b2c_count})")
         
         # --- Display Validation Results ---
         if val_errors:
@@ -123,7 +202,7 @@ if uploaded_file is not None:
         st.subheader("Generated JSON")
         
         # Convert Python dictionary to formatted JSON string
-        json_string = json.dumps(json_data, indent=4)
+        json_string = json.dumps(json_data, indent=4, default=str)
         
         # Download Button
         st.download_button(
@@ -135,4 +214,4 @@ if uploaded_file is not None:
         
         # Preview
         with st.expander("Preview JSON Data", expanded=False):
-            st.json(json_data)
+            st.json(json_data[:5] if len(json_data) > 5 else json_data)  # Show first 5 invoices
