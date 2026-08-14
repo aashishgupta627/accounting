@@ -1,138 +1,217 @@
 import streamlit as st
 import pandas as pd
-import re
 import json
-import io
+import re
+from io import BytesIO
 
-st.set_page_config(
-    page_title="Purchase Book Converter & GST Formatter", 
-    page_icon="📊", 
-    layout="wide"
-)
+st.set_page_config(page_title="GST & Sales Data Ingestion Engine", layout="wide")
 
-st.title("📊 Purchase Book Parser & GST Formatter")
-st.write(
-    "Upload your raw purchase book Excel file to split by taxability "
-    "(Taxable, Exempted, CESS) and download cleaned Excel & JSON formats."
-)
+st.title("⚡ Sales Data Ingestion & Normalization Engine")
+st.write("Upload your raw sales files (Split Summary/Item files or Single Integrated sheets) to extract clean, standardized data for Tally and GST Portal processing.")
 
-uploaded_file = st.file_uploader("Upload Raw Purchase Book (.xlsx / .xls)", type=["xlsx", "xls"])
+# --- UTILITY & SANITIZATION FUNCTIONS ---
+def clean_gstin(val):
+    if pd.isna(val) or not str(val).strip():
+        return None
+    val = str(val).strip().upper()
+    # Check for 15-char valid GSTIN regex
+    if re.match(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$', val):
+        return val
+    return None # Return None if local state tag like 'PB', 'CS', etc.
 
-if uploaded_file is not None:
+def format_hsn(val):
+    if pd.isna(val):
+        return ""
+    val_str = str(val).split('.')[0].strip()
+    return val_str if val_str != "nan" else ""
+
+def format_date(val):
+    if pd.isna(val):
+        return ""
     try:
-        xls = pd.ExcelFile(uploaded_file)
-        sheet_name = st.selectbox("Select Sheet", xls.sheet_names)
-        df = pd.read_excel(xls, sheet_name=sheet_name)
+        return pd.to_datetime(val).strftime('%Y-%m-%d')
+    except:
+        return str(val).strip()
+
+# --- ADAPTER A: COMPANY 1 (NESTED / SPLIT FILES) ---
+def parse_nested_company_1(item_file, summary_file=None):
+    xls_item = pd.ExcelFile(item_file)
+    sheet_name = 'SALE_BOOK_WITH_ITEM_DETAILS' if 'SALE_BOOK_WITH_ITEM_DETAILS' in xls_item.sheet_names else xls_item.sheet_names[0]
+    df_raw = pd.read_excel(xls_item, sheet_name=sheet_name)
+    
+    # Locate header row containing 'ITEM CODE'
+    header_idx = None
+    for idx, row in df_raw.iterrows():
+        if row.astype(str).str.contains('ITEM CODE').any():
+            header_idx = idx
+            break
+            
+    if header_idx is not None:
+        df_data = df_raw.iloc[header_idx + 1:].copy()
+        df_data.columns = [str(c).strip() for c in df_raw.iloc[header_idx].values]
+    else:
+        df_data = df_raw.copy()
+
+    records = []
+    current_parent = {}
+    
+    for _, row in df_data.iterrows():
+        col0 = str(row.iloc[0]).strip()
         
-        invoices = []
-        current_inv = None
-
-        for idx, row in df.iterrows():
-            col0 = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-            col2 = str(row.iloc[2]) if pd.notna(row.iloc[2]) else ""
-
-            # Invoice Header Detection
-            if ("PB/" in col0 or "TRN" in col0 or re.search(r'\d{2}-[A-Za-z]{3}-\d{2}', col0)) and "FROM:" not in col0 and "PURCHASE_BOOK" not in col0:
-                match = re.search(r'(\d{2}-[A-Za-z]{3}-\d{2})\s+(PB/\d+|\S+)\s+(.*?)\s+(User\s*:.*)?$', col0.strip())
-                if match:
-                    date, trn_no, party_name, user = match.groups()
-                    current_inv = {
-                        'date': date,
-                        'voucher_no': trn_no,
-                        'supplier_name': party_name.strip(),
-                        'user': user.strip() if user else "",
-                        'items': [],
-                        'taxable_value': 0.0,
-                        'tax_value': 0.0,
-                        'exempted_value': 0.0,
-                        'gst_cess_value': 0.0,
-                        'total_amount': 0.0
-                    }
-                    invoices.append(current_inv)
-
-            elif current_inv is not None:
-                if col2 == "TOTAL:":
-                    taxable, tax, exempt = 0.0, 0.0, 0.0
-                    for item in current_inv['items']:
-                        if item['gst_pct'] > 0:
-                            taxable += item['amount']
-                            tax += item['gst_amt']
-                        else:
-                            exempt += item['amount']
-
-                    current_inv['taxable_value'] = round(taxable, 2)
-                    current_inv['tax_value'] = round(tax, 2)
-                    current_inv['exempted_value'] = round(exempt, 2)
-                    current_inv['total_amount'] = round(taxable + tax + exempt, 2)
-
-                elif col2 not in ['GRAND TOTAL:', 'ITEM NAME', ''] and pd.notna(row.iloc[2]):
-                    gst_pct = float(pd.to_numeric(row.iloc[19], errors='coerce') or 0.0)
-                    amount = float(pd.to_numeric(row.iloc[21], errors='coerce') or 0.0)
-                    gst_amt = float(pd.to_numeric(row.iloc[22], errors='coerce') or 0.0)
-
-                    item = {
-                        'item_name': col2,
-                        'qty': float(pd.to_numeric(row.iloc[8], errors='coerce') or 0.0),
-                        'p_rate': float(pd.to_numeric(row.iloc[10], errors='coerce') or 0.0),
-                        'gst_pct': gst_pct,
-                        'amount': amount,
-                        'gst_amt': gst_amt,
-                        'hsn': str(row.iloc[23]) if pd.notna(row.iloc[23]) else ""
-                    }
-                    current_inv['items'].append(item)
-
-        # Build Summary DF
-        summary_data = []
-        for inv in invoices:
-            summary_data.append({
-                'Date': inv['date'],
-                'Voucher No': inv['voucher_no'],
-                'Supplier Name': inv['supplier_name'],
-                'Taxable Value': inv['taxable_value'],
-                'Tax Value': inv['tax_value'],
-                'Exempted Value': inv['exempted_value'],
-                'GST Cess Value': inv['gst_cess_value'],
-                'Total Amount': inv['total_amount']
+        # Parent row check (Date format string or Timestamp object in 1st column)
+        if re.match(r'^\d{4}-\d{2}-\d{2}', col0) or re.match(r'^\d{2}/\d{2}/\d{4}', col0):
+            current_parent = {
+                "invoice_date": format_date(row.iloc[0]),
+                "invoice_no": str(row.iloc[2]).strip() if not pd.isna(row.iloc[2]) else "",
+                "party_name": str(row.iloc[3]).strip() if not pd.isna(row.iloc[3]) else "Cash",
+                "doctor_name": str(row.iloc[4]).strip() if not pd.isna(row.iloc[4]) else ""
+            }
+        elif col0 and col0.isdigit() and current_parent.get("invoice_no"):
+            # Item Detail Row
+            hsn = format_hsn(row.get('HSNCODE', ''))
+            records.append({
+                "invoice_no": current_parent.get("invoice_no"),
+                "invoice_date": current_parent.get("invoice_date"),
+                "party_name": current_parent.get("party_name"),
+                "gstin": None,
+                "is_b2c": True,
+                "item_code": str(row.get('ITEM CODE', '')).strip(),
+                "item_name": str(row.get('ITEM NAME', '')).strip(),
+                "hsn_code": hsn,
+                "quantity": float(row.get('QTY.', 0) or 0),
+                "rate": float(row.get('RATE', 0) or 0),
+                "taxable_amount": float(row.get('TAXABLE Amt.', 0) or 0),
+                "gst_rate": float(row.get('GST%', 0) or 0),
+                "gst_amount": float(row.get('GST AMT.', 0) or 0)
             })
 
-        summary_df = pd.DataFrame(summary_data)
-
-        st.success(f"Successfully processed {len(summary_df)} invoices!")
+    # If Summary File is also provided, merge GSTIN & Header Totals
+    if summary_file:
+        xls_sum = pd.ExcelFile(summary_file)
+        sum_sheet = 'CONSOLIDATED SALE BOOK' if 'CONSOLIDATED SALE BOOK' in xls_sum.sheet_names else xls_sum.sheet_names[0]
+        df_sum_raw = pd.read_excel(xls_sum, sheet_name=sum_sheet)
         
-        # Display Summary Metrics
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Taxable Value", f"₹{summary_df['Taxable Value'].sum():,.2f}")
-        c2.metric("Total Tax Value", f"₹{summary_df['Tax Value'].sum():,.2f}")
-        c3.metric("Total Exempted Value", f"₹{summary_df['Exempted Value'].sum():,.2f}")
-        c4.metric("Grand Total Amount", f"₹{summary_df['Total Amount'].sum():,.2f}")
+        # Header lookup
+        s_idx = next((i for i, r in df_sum_raw.iterrows() if r.astype(str).str.contains('INV.NO').any()), None)
+        if s_idx is not None:
+            df_sum = df_sum_raw.iloc[s_idx + 1:].copy()
+            df_sum.columns = [str(c).strip() for c in df_sum_raw.iloc[s_idx].values]
+            
+            # Map GSTINs to extracted records
+            gstin_map = dict(zip(df_sum['INV.NO'].astype(str).str.strip(), df_sum['GST NO']))
+            for rec in records:
+                gstin_val = clean_gstin(gstin_map.get(rec['invoice_no']))
+                rec['gstin'] = gstin_val
+                rec['is_b2c'] = False if gstin_val else True
+                
+    return pd.DataFrame(records)
 
-        st.subheader("Invoice Level Preview")
-        st.dataframe(summary_df, use_container_width=True)
+# --- ADAPTER B: COMPANY 2 (FLAT / INTEGRATED FILES) ---
+def parse_flat_company_2(file):
+    xls = pd.ExcelFile(file)
+    sheet_name = 'DATA' if 'DATA' in xls.sheet_names else xls.sheet_names[0]
+    df = pd.read_excel(xls, sheet_name=sheet_name)
+    
+    records = []
+    for _, row in df.iterrows():
+        inv_no = str(row.get('Bill-Nos.', '')).strip()
+        if not inv_no or inv_no == 'nan':
+            continue
+            
+        gstin_val = clean_gstin(row.get('GST No.'))
+        records.append({
+            "invoice_no": inv_no,
+            "invoice_date": format_date(row.get('Date')),
+            "party_name": str(row.get('Account', '')).strip(),
+            "gstin": gstin_val,
+            "is_b2c": False if gstin_val else True,
+            "item_code": "",
+            "item_name": "",
+            "hsn_code": format_hsn(row.get('HSN \\ SAC')),
+            "quantity": float(row.get('Tot-Qty.', 0) or 0),
+            "rate": 0.0,
+            "taxable_amount": float(row.get('Taxable-Amt.', 0) or 0),
+            "cgst_amount": float(row.get('CGST-Amt.', 0) or 0),
+            "sgst_amount": float(row.get('SGST-Amt.', 0) or 0),
+            "igst_amount": float(row.get('IGST-Amt.', 0) or 0),
+            "gst_amount": float(row.get('GST-Amt.', 0) or 0)
+        })
+    return pd.DataFrame(records)
 
-        # Export Buttons
-        col_ex, col_js = st.columns(2)
 
-        # Excel Buffer
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            summary_df.to_excel(writer, index=False, sheet_name='Summary_Register')
-        excel_buffer.seek(0)
+# --- STREAMLIT UI LAYOUT ---
+sidebar = st.sidebar
+sidebar.header("📁 Ingestion Mode Settings")
+file_type = sidebar.radio("Select Processing Adapter:", ["Auto-Detect", "Company 1 (Split Summary + Item Files)", "Company 2 (Single Flat Data Sheet)"])
 
-        col_ex.download_button(
-            label="📥 Download Clean Excel",
-            data=excel_buffer,
-            file_name="Converted_Purchase_Book.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+col1, col2 = st.columns(2)
 
-        # JSON Buffer
-        json_str = json.dumps(invoices, indent=4)
-        col_js.download_button(
-            label="📥 Download JSON Format",
-            data=json_str,
-            file_name="Converted_Purchase_Book.json",
-            mime="application/json"
-        )
+with col1:
+    primary_file = st.file_uploader("Upload Primary File (Item details or Flat file)", type=["xlsx", "xls"])
+with col2:
+    summary_file = st.file_uploader("Upload Summary File (Optional, for Company 1 Split structure)", type=["xlsx", "xls"])
 
-    except Exception as e:
-        st.error(f"Error processing file: {e}")
+if primary_file:
+    st.divider()
+    st.subheader("⚙️ Processing Ingestion Pipelines")
+    
+    parsed_df = pd.DataFrame()
+    
+    with st.spinner("Parsing and normalizing file data..."):
+        try:
+            # AUTO-DETECTION ENGINE
+            if file_type == "Auto-Detect":
+                xls = pd.ExcelFile(primary_file)
+                if 'DATA' in xls.sheet_names or 'B2B INVOICE' in xls.sheet_names:
+                    st.info("Detected Layout: **Company 2 Single Flat Integrated File**")
+                    parsed_df = parse_flat_company_2(primary_file)
+                else:
+                    st.info("Detected Layout: **Company 1 Split/Nested Data File**")
+                    parsed_df = parse_nested_company_1(primary_file, summary_file)
+            elif file_type == "Company 1 (Split Summary + Item Files)":
+                parsed_df = parse_nested_company_1(primary_file, summary_file)
+            else:
+                parsed_df = parse_flat_company_2(primary_file)
+                
+            st.success(f"Successfully normalized **{len(parsed_df)} line items**!")
+            
+            # --- DATA METRICS & PREVIEW ---
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Invoices", parsed_df['invoice_no'].nunique())
+            m2.metric("Total Taxable Amt", f"₹ {parsed_df['taxable_amount'].sum():,.2f}")
+            m3.metric("B2B Records", len(parsed_df[~parsed_df['is_b2c']]))
+            m4.metric("B2C Records", len(parsed_df[parsed_df['is_b2c']]))
+
+            st.write("### Normalized Data Preview")
+            st.dataframe(parsed_df.head(100), use_container_width=True)
+
+            # --- EXPORT MODULE ---
+            st.divider()
+            st.subheader("📥 Export Clean Output")
+            
+            exp_col1, exp_col2 = st.columns(2)
+            
+            # Excel Export
+            output_excel = BytesIO()
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                parsed_df.to_excel(writer, index=False, sheet_name='Normalized_Sales_Data')
+            output_excel.seek(0)
+            
+            exp_col1.download_button(
+                label="📊 Download Clean Excel File",
+                data=output_excel,
+                file_name="Clean_Normalized_Sales_Data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            # JSON Export
+            json_str = parsed_df.to_json(orient='records', indent=2)
+            exp_col2.download_button(
+                label="📄 Download Canonical JSON",
+                data=json_str,
+                file_name="Canonical_Sales_Data.json",
+                mime="application/json"
+            )
+
+        except Exception as e:
+            st.error(f"Error parsing file: {str(e)}")
