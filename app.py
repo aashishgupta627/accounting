@@ -49,6 +49,16 @@ ways — check the raw grid carefully for which one applies:
    this pattern, use "blob_extract" instead: {"CANONICAL_NAME": "<regex with
    a (?P<v>...) named group>", ...}. Never use both on the same marker.
 
+IMPORTANT for merged-cell blobs: leading/trailing whitespace and internal
+spacing inside the blob is unpredictable (it comes from padded Excel
+columns being concatenated). Never anchor a pattern to the start of the
+string with "^" unless you also allow for leading whitespace (e.g. use
+"^\\s*..." not "^..."). Prefer the narrowest pattern that uniquely
+identifies the row — usually just the voucher-number token itself (e.g.
+"PB/\\d+") — over a pattern that tries to match the whole line's shape.
+The same applies inside blob_extract sub-patterns: extract each field with
+a minimal, unanchored regex rather than a full-line template.
+
 Respond with JSON only, matching the schema given."""
 
 PROMPT_A_USER_TEMPLATE = """Sheet name: {sheet_name}
