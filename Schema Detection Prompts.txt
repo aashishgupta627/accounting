@@ -1,0 +1,117 @@
+# Schema detection prompts
+
+Canonical field names are deliberately written in Tally's own voucher/inventory
+vocabulary, so the detected schema doubles as the Tally import mapping — no
+separate translation step later.
+
+## Canonical field vocabulary (closed list — the model may only use these keys)
+
+**Voucher-level (invoice header) fields:**
+`DATE, VOUCHERNUMBER, PARTYNAME, PARTYGSTIN, NARRATION, ROUNDOFFAMOUNT, BILLAMOUNT`
+
+**Inventory-entry (item row) fields:**
+`STOCKITEMNAME, BATCHNAME, EXPIRYDATE, ACTUALQTY, FREEQTY, RATE, GSTRATE, AMOUNT,
+DISCOUNT, TAXABLEVALUE, GSTAMOUNT, HSNCODE, NETAMOUNT`
+
+**Consolidated Summary sheet fields:**
+`VOUCHERNUMBER, PARTYNAME, PARTYGSTIN, BILLAMOUNT, ROUNDOFFAMOUNT, STATECODE`
+
+---
+
+## Prompt A — Item Details (detail) sheet
+
+**System:**
+```
+You map raw spreadsheet grids to a fixed schema for accounting-voucher import.
+You will be shown the first ~20-25 rows of an Excel sheet as (row, col): value
+pairs. The sheet mixes voucher header rows with inventory-entry (item) rows.
+
+You must map columns to this CLOSED set of canonical field names only —
+never invent a field name, never use one not in this list:
+
+Voucher-level: DATE, VOUCHERNUMBER, PARTYNAME, PARTYGSTIN, NARRATION,
+ROUNDOFFAMOUNT, BILLAMOUNT
+
+Inventory-entry: STOCKITEMNAME, BATCHNAME, EXPIRYDATE, ACTUALQTY, FREEQTY,
+RATE, GSTRATE, AMOUNT, DISCOUNT, TAXABLEVALUE, GSTAMOUNT, HSNCODE, NETAMOUNT
+
+If a canonical field has no matching column in this sheet, omit it from the
+map rather than guessing.
+
+Voucher-level fields on an invoice-header row can appear in TWO different
+ways — check the raw grid carefully for which one applies:
+1. Separate columns — each field sits in its own column index. Use "fields":
+   {"CANONICAL_NAME": col_index, ...}.
+2. One merged cell — Excel merged cells often show up as a single long
+   string in one column with every other column NaN on that row (you'll see
+   long whitespace-padded text like "01-May-26   PB/295   PARTY NAME   User:
+   R.RAWAT" all sitting in column 0). If you see this pattern, use
+   "blob_extract" instead: {"CANONICAL_NAME": "<regex with a (?P<v>...) named
+   group that extracts just that field from the blob>", ...}. Never use both
+   "fields" and "blob_extract" on the same marker — pick whichever matches
+   what you actually see.
+
+Respond with JSON only, matching the schema given.
+```
+
+**User template:**
+```
+Sheet name: {sheet_name}
+Paired summary sheet: {summary_sheet_name}
+
+Raw grid (row_index, col_index: value), rows 0-{n}:
+{raw_grid_dump}
+
+Return JSON exactly in this shape:
+{{
+  "sheet_type": "item_details",
+  "header_rows": [<row indices that are column-header labels>],
+  "data_start_row": <first row index containing real voucher/item data>,
+  "invoice_block_marker": {{
+    "column": <col index that holds the voucher number, or the single blob column>,
+    "pattern": "<regex that matches only voucher-number values in that column>",
+    "fields": {{"<canonical voucher field>": <col index>, ...}},
+    "blob_extract": {{"<canonical voucher field>": "<regex with (?P<v>...) group>", ...}}
+  }},
+  "item_row_column_map": {{"<canonical inventory field>": <col index>, ...}},
+  "skip_row_rules": [{{"column": <idx>, "equals": "<literal value to skip, e.g. TOTAL:>"}}],
+  "confidence": <0-1 float, your own estimate of how sure you are>
+}}
+```
+
+## Prompt B — Consolidated Summary sheet
+
+**User template:**
+```
+Sheet name: {sheet_name}
+Raw grid (row_index, col_index: value), rows 0-{n}:
+{raw_grid_dump}
+
+Map columns to this CLOSED set only: VOUCHERNUMBER, PARTYNAME, PARTYGSTIN,
+BILLAMOUNT, ROUNDOFFAMOUNT, STATECODE. Omit any field with no matching column.
+
+Return JSON exactly in this shape:
+{{
+  "sheet_type": "consolidated_summary",
+  "header_row": <row index>,
+  "column_map": {{"<canonical field>": <col index>, ...}},
+  "confidence": <0-1 float>
+}}
+```
+
+## Prompt C — join key transform
+
+**User template:**
+```
+Sample VOUCHERNUMBER values from Consolidated Summary: {summary_keys}
+Sample voucher-number values from Item Details: {detail_keys}
+
+Determine how a Consolidated Summary key maps to its Item Details counterpart.
+Respond with JSON using ONLY one of these transform types:
+
+{{"type": "identity"}}
+{{"type": "strip_prefix", "prefix": "<string>"}}
+{{"type": "regex_extract", "from": "summary", "pattern": "<regex with one capture group>", "template": "<output template using {{1}} for the captured group>"}}
+
+Return only the JSON object, nothing else.
+```
