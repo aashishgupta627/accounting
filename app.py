@@ -18,7 +18,7 @@ import json
 import streamlit as st
 import pandas as pd
 
-from validate_schema import validate_and_decide, validate_join_transform
+from validate_schema import validate_and_decide, validate_join_transform, apply_transform
 from generic_parser import parse_item_details, parse_summary, build_invoices
 from sheet_sampler import serialize_raw_grid, sample_join_keys, build_prompt_a, build_prompt_b, build_prompt_c
 
@@ -292,6 +292,26 @@ if run and uploaded is not None:
 
     if report.join_match_rate < 0.9:
         st.error("Join match rate below 90% — the transform likely doesn't fit this file. Check the transform JSON.")
+        with st.expander("Debug: sample keys from both sides", expanded=True):
+            summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
+            detail_sample = list(vouchers.keys())[:10]
+            mapped_sample = [
+                {"summary_key": k, "transform_output": apply_transform(k, transform) if k else None}
+                for k in summary_sample
+            ]
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.caption("Summary VOUCHERNUMBER (raw) -> after transform")
+                st.dataframe(pd.DataFrame(mapped_sample), use_container_width=True, hide_index=True)
+            with dc2:
+                st.caption("Item Details voucher keys (as parsed)")
+                st.write(detail_sample)
+            st.caption(
+                "If the 'transform_output' column doesn't look like the Item Details keys on the "
+                "right, the transform JSON is wrong for this file — e.g. a regex_extract transform "
+                "left over from a different example. Purchase-style files usually need "
+                '{"type": "identity"}.'
+            )
 
     if report.mismatch_detail:
         st.subheader("Mismatched invoices (items sum + round-off vs bill amount)")
