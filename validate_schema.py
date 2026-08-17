@@ -168,9 +168,14 @@ def validate_item_details_schema(schema: dict, sample_df: pd.DataFrame) -> Valid
             except re.error as e:
                 result.add_failure(f"invoice_block_marker.blob_extract[{f}] invalid regex: {e}")
                 continue
-            blob_col_vals = marker_rows.iloc[:, marker_col].astype(str)
-            sub_matches = blob_col_vals.apply(lambda v: bool(sub_compiled.search(v))).sum()
-            result.stats[f"blob_extract_matches.{f}"] = int(sub_matches)
+            # Plain Python loop, not pandas .apply().sum(): on some pandas
+            # versions, summing an EMPTY Series backed by the newer "str"
+            # dtype returns '' instead of 0, which then breaks int(''). A
+            # zero-row match here is itself meaningful (worth reporting),
+            # not a state that should crash Layer A.
+            blob_values = marker_rows.iloc[:, marker_col].astype(str).tolist()
+            sub_matches = sum(1 for v in blob_values if sub_compiled.search(v))
+            result.stats[f"blob_extract_matches.{f}"] = sub_matches
             if len(marker_rows) > 0 and sub_matches == 0:
                 result.add_failure(
                     f"invoice_block_marker.blob_extract[{f}] matched 0 of "
