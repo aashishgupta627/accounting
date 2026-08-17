@@ -20,6 +20,85 @@ import pandas as pd
 
 from validate_schema import validate_and_decide, validate_join_transform
 from generic_parser import parse_item_details, parse_summary, build_invoices
+from sheet_sampler import serialize_raw_grid, sample_join_keys, build_prompt_a, build_prompt_b, build_prompt_c
+
+# Kept as plain strings here (mirrors schema_detection_prompts.md) so the app
+# can assemble copy-ready prompt text without parsing markdown at runtime.
+PROMPT_A_SYSTEM = """You map raw spreadsheet grids to a fixed schema for accounting-voucher import.
+You will be shown the first ~20-25 rows of an Excel sheet as (row, col): value
+pairs. The sheet mixes voucher header rows with inventory-entry (item) rows.
+
+You must map columns to this CLOSED set of canonical field names only —
+never invent a field name, never use one not in this list:
+
+Voucher-level: DATE, VOUCHERNUMBER, PARTYNAME, PARTYGSTIN, NARRATION,
+ROUNDOFFAMOUNT, BILLAMOUNT
+
+Inventory-entry: STOCKITEMNAME, BATCHNAME, EXPIRYDATE, ACTUALQTY, FREEQTY,
+RATE, GSTRATE, AMOUNT, DISCOUNT, TAXABLEVALUE, GSTAMOUNT, HSNCODE, NETAMOUNT
+
+If a canonical field has no matching column in this sheet, omit it from the
+map rather than guessing.
+
+Voucher-level fields on an invoice-header row can appear in TWO different
+ways — check the raw grid carefully for which one applies:
+1. Separate columns — each field sits in its own column index. Use "fields":
+   {"CANONICAL_NAME": col_index, ...}.
+2. One merged cell — Excel merged cells often show up as a single long
+   string in one column with every other column NaN on that row. If you see
+   this pattern, use "blob_extract" instead: {"CANONICAL_NAME": "<regex with
+   a (?P<v>...) named group>", ...}. Never use both on the same marker.
+
+Respond with JSON only, matching the schema given."""
+
+PROMPT_A_USER_TEMPLATE = """Sheet name: {sheet_name}
+Paired summary sheet: {summary_sheet_name}
+
+Raw grid (row_index, col_index: value), rows 0-{n}:
+{raw_grid_dump}
+
+Return JSON exactly in this shape:
+{{
+  "sheet_type": "item_details",
+  "header_rows": [<row indices that are column-header labels>],
+  "data_start_row": <first row index containing real voucher/item data>,
+  "invoice_block_marker": {{
+    "column": <col index that holds the voucher number, or the single blob column>,
+    "pattern": "<regex that matches only voucher-number values in that column>",
+    "fields": {{"<canonical voucher field>": <col index>, ...}},
+    "blob_extract": {{"<canonical voucher field>": "<regex with (?P<v>...) group>", ...}}
+  }},
+  "item_row_column_map": {{"<canonical inventory field>": <col index>, ...}},
+  "skip_row_rules": [{{"column": <idx>, "equals": "<literal value to skip, e.g. TOTAL:>"}}],
+  "confidence": <0-1 float, your own estimate of how sure you are>
+}}"""
+
+PROMPT_B_USER_TEMPLATE = """Sheet name: {sheet_name}
+Raw grid (row_index, col_index: value), rows 0-{n}:
+{raw_grid_dump}
+
+Map columns to this CLOSED set only: VOUCHERNUMBER, PARTYNAME, PARTYGSTIN,
+BILLAMOUNT, ROUNDOFFAMOUNT, STATECODE. Omit any field with no matching column.
+
+Return JSON exactly in this shape:
+{{
+  "sheet_type": "consolidated_summary",
+  "header_row": <row index>,
+  "column_map": {{"<canonical field>": <col index>, ...}},
+  "confidence": <0-1 float>
+}}"""
+
+PROMPT_C_USER_TEMPLATE = """Sample VOUCHERNUMBER values from Consolidated Summary: {summary_keys}
+Sample voucher-number values from Item Details: {detail_keys}
+
+Determine how a Consolidated Summary key maps to its Item Details counterpart.
+Respond with JSON using ONLY one of these transform types:
+
+{{"type": "identity"}}
+{{"type": "strip_prefix", "prefix": "<string>"}}
+{{"type": "regex_extract", "from": "summary", "pattern": "<regex with one capture group>", "template": "<output template using {{1}} for the captured group>"}}
+
+Return only the JSON object, nothing else."""
 
 st.set_page_config(page_title="Schema-driven invoice extractor", layout="wide")
 st.title("Schema-driven invoice extractor — test harness")
@@ -103,6 +182,40 @@ else:
     default_item = "{}"
     default_summary = "{}"
     default_transform = '{"type": "identity"}'
+
+if uploaded is not None:
+    with st.expander("1a. Generate detection prompts (copy into your LLM call, paste the JSON result below)", expanded=False):
+        item_df_preview = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
+        summary_df_preview = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
+
+        n_rows_item = st.slider("Item Details rows to sample", 10, 40, 25)
+        n_rows_summary = st.slider("Summary rows to sample", 5, 30, 15)
+
+        prompt_a = build_prompt_a(
+            item_sheet_name, summary_sheet_name, item_df_preview,
+            PROMPT_A_SYSTEM, PROMPT_A_USER_TEMPLATE, n_rows=n_rows_item,
+        )
+        prompt_b = build_prompt_b(summary_sheet_name, summary_df_preview, PROMPT_B_USER_TEMPLATE, n_rows=n_rows_summary)
+
+        tab1, tab2, tab3 = st.tabs(["Prompt A — Item Details", "Prompt B — Summary", "Prompt C — join transform"])
+        with tab1:
+            st.caption("System prompt")
+            st.code(prompt_a["system"], language="text")
+            st.caption("User prompt")
+            st.code(prompt_a["user"], language="text")
+        with tab2:
+            st.caption("User prompt")
+            st.code(prompt_b["user"], language="text")
+        with tab3:
+            st.caption("Column + header row for the voucher number in each sheet (used only to sample keys)")
+            cc1, cc2, cc3 = st.columns(3)
+            summary_key_col = cc1.number_input("Summary voucher-number column", min_value=0, value=1, key="ck_summary")
+            detail_key_col = cc2.number_input("Item Details voucher-number column", min_value=0, value=1, key="ck_detail")
+            header_rows_to_skip = cc3.number_input("Rows to skip (header rows)", min_value=0, value=1, key="ck_skip")
+            s_keys = sample_join_keys(summary_df_preview.iloc[header_rows_to_skip:, summary_key_col], n=8)
+            d_keys = sample_join_keys(item_df_preview.iloc[header_rows_to_skip:, detail_key_col], n=8)
+            prompt_c = build_prompt_c(s_keys, d_keys, PROMPT_C_USER_TEMPLATE)
+            st.code(prompt_c["user"], language="text")
 
 st.header("2. Schema (paste what the LLM detection call would return)")
 col1, col2, col3 = st.columns(3)
