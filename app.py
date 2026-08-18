@@ -78,28 +78,50 @@ _WS_BEFORE_PUNCT = re.compile(r"\s+([:.])")
 _GRAND_TOTAL_RE = re.compile(r"^\s*GRAND\s+TOTAL\s*:?\s*$", re.IGNORECASE)
 
 
-def clean_item_details_df(df, marker_column=2):
-    """Normalize stray whitespace in marker-column text and drop
-    workbook-level GRAND TOTAL footer rows. Returns a new DataFrame."""
+def clean_item_details_df(df, item_mapping):
+    """Normalize stray whitespace before punctuation in every skip-rule
+    column (so 'TOTAL :' matches an 'equals: TOTAL:' rule the same way
+    'TOTAL:' does), and drop any row containing a workbook-level
+    GRAND TOTAL footer cell in ANY column — that row belongs to the whole
+    sheet, not to whichever invoice happens to precede it, and must never
+    be parsed as an item line. Returns a new DataFrame."""
     df = df.copy()
 
     def normalize_cell(v):
         if isinstance(v, str):
-            v = _WS_BEFORE_PUNCT.sub(r"\1", v)  # "TOTAL :" -> "TOTAL:"
-            return v
+            return _WS_BEFORE_PUNCT.sub(r"\1", v)  # "TOTAL :" -> "TOTAL:"
         return v
 
-    if marker_column in df.columns:
-        df[marker_column] = df[marker_column].apply(normalize_cell)
-        grand_total_mask = df[marker_column].apply(
-            lambda v: isinstance(v, str) and bool(_GRAND_TOTAL_RE.match(v))
+    # Normalize whitespace in every column referenced by a skip_row_rule
+    # (this is where TOTAL:-style markers actually live) plus the
+    # invoice_block_marker column, in case a rule targets that instead.
+    skip_columns = {
+        rule.get("column")
+        for rule in item_mapping.get("skip_row_rules", [])
+        if rule.get("column") is not None
+    }
+    marker_column = item_mapping.get("invoice_block_marker", {}).get("column")
+    if marker_column is not None:
+        skip_columns.add(marker_column)
+
+    for col in skip_columns:
+        if col in df.columns:
+            df[col] = df[col].apply(normalize_cell)
+
+    # Row-wide safety net: drop any row where ANY cell is a GRAND TOTAL
+    # footer, regardless of which column it happens to sit in.
+    grand_total_row_mask = df.apply(
+        lambda row: any(
+            isinstance(v, str) and bool(_GRAND_TOTAL_RE.match(v)) for v in row
+        ),
+        axis=1,
+    )
+    if grand_total_row_mask.any():
+        st.caption(
+            f"Cleanup: dropped {int(grand_total_row_mask.sum())} 'GRAND TOTAL' "
+            f"footer row(s) not belonging to any invoice."
         )
-        if grand_total_mask.any():
-            st.caption(
-                f"Cleanup: dropped {int(grand_total_mask.sum())} 'GRAND TOTAL' "
-                f"footer row(s) not belonging to any invoice."
-            )
-            df = df[~grand_total_mask].reset_index(drop=True)
+        df = df[~grand_total_row_mask].reset_index(drop=True)
 
     return df
 
@@ -266,8 +288,7 @@ if layout_choice == "two_sheet_joined":
         item_df = pd.read_excel(uploaded, sheet_name=resolved_item_sheet, header=None)
         summary_df = pd.read_excel(uploaded, sheet_name=resolved_summary_sheet, header=None)
 
-        marker_col = item_mapping.get("invoice_block_marker", {}).get("column", 2)
-        item_df = clean_item_details_df(item_df, marker_column=marker_col)
+        item_df = clean_item_details_df(item_df, item_mapping)
 
         res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
 
