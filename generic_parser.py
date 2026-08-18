@@ -74,6 +74,22 @@ def parse_item_details(df_raw: pd.DataFrame, schema: dict) -> dict:
         if not line_id_val:
             continue
 
+        # Structural guard against TOTAL:/TOTAL :/GRAND TOTAL:-style rows
+        # (and any other subtotal/footer line, however it's worded): a
+        # genuine item line always has a recorded quantity, even if it's
+        # 0. Footer/total rows leave every per-item column blank and only
+        # populate the summed AMOUNT/GSTAMOUNT columns. Checking this
+        # structurally -- rather than matching TOTAL text -- means it
+        # doesn't depend on exact wording or whitespace (so it also
+        # catches inconsistencies like a stray space before the colon),
+        # and it won't misfire on a real product whose name happens to
+        # start with "Total" (that item would still carry a real
+        # quantity). skip_row_rules remains available for any other
+        # vendor-specific row-skip conditions a schema needs.
+        qty_col = item_map.get("ACTUALQTY")
+        if qty_col is not None and pd.isna(row.iloc[qty_col]):
+            continue
+
         item = {}
         for field_name, idx in item_map.items():
             val = row.iloc[idx]
@@ -102,11 +118,12 @@ def _row_matches_skip_rule(row, skip_rules):
 
 def parse_summary(df_raw: pd.DataFrame, schema: dict) -> list:
     """Returns a list of row dicts keyed by canonical field name, skipping
-    header/footer/junk rows (blank, repeated header text, or non-voucher
-    total/summary lines)."""
+    header rows and any footer/subtotal/summary rows -- wherever in the
+    sheet they occur."""
     header_row = schema["header_row"]
     col_map = schema["column_map"]
     voucher_col = col_map["VOUCHERNUMBER"]
+    party_col = col_map.get("PARTYNAME")
 
     rows = []
     for i in range(header_row + 1, len(df_raw)):
@@ -116,10 +133,29 @@ def parse_summary(df_raw: pd.DataFrame, schema: dict) -> list:
         if pd.isna(voucher_no):
             continue
         voucher_no = str(voucher_no).strip()
-        if not voucher_no or voucher_no.lower().startswith("total"):
+        if not voucher_no:
+            continue
+        if voucher_no.lower().startswith("total"):
+            # e.g. "Total :" / "Total No. of Invoice : N" -- a sheet-level
+            # or per-block aggregate row, not an invoice. Skip it (don't
+            # break/stop): some exports place subtotal rows mid-sheet
+            # with real invoices continuing below them, so treating this
+            # as an end-of-data marker would silently drop real data.
             continue
         if voucher_no.replace(".", "", 1).isdigit():
             # pure-numeric rows are footer/count lines, not voucher numbers
+            continue
+
+        # Structural guard against the SUMMARY block that follows the
+        # "Total :" row (e.g. "TAXABLE VALUE", "TAX VALUE", "EXEMPTED
+        # VALUE", "GST CESS VALUE"): none of those lines start with
+        # "total", so the check above misses them, and their exact
+        # wording isn't guaranteed to stay the same across exports. What
+        # IS always true: a genuine invoice row has a party attached to
+        # it, and a sheet-level aggregate row never does. Checking that
+        # structurally catches the whole footer block regardless of
+        # label text or where it sits in the sheet.
+        if party_col is not None and pd.isna(row.iloc[party_col]):
             continue
 
         record = {}
