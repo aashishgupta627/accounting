@@ -1,130 +1,44 @@
 """
-Testing harness for the schema-driven pipeline.
+Unified test harness — one app, three layout families, dispatched through
+orchestrator.py exactly the way production would.
 
-Workflow (LLM call intentionally NOT wired in yet — schema JSON is pasted in
-by hand, exactly what an LLM detection call would return, so every other
-stage can be tested independently first):
+TERMINOLOGY (see validate_schema.py's module docstring for the full
+version): the CANONICAL SCHEMA (VOUCHER_FIELDS / ITEM_FIELDS /
+SUMMARY_FIELDS) is fixed and never changes. What you paste into the text
+areas below is a MAPPING — per-file column addresses into that fixed
+schema, plus an open extra_fields bucket for anything vendor-specific that
+isn't part of the schema at all.
 
-  1. Upload an Excel file (Purchase or Sales export)
-  2. Paste/edit the Item Details schema, the Summary schema, and the join
-     transform as JSON
-  3. Run Layer A -> pass/fail + stats for each schema, shown immediately
-  4. If both pass, run the deterministic parser -> Layer B report
-  5. Preview + download the resulting JSON
-
-Run with: streamlit run streamlit_app.py
+Run with: streamlit run app.py
 """
 import json
 import streamlit as st
 import pandas as pd
 
-from validate_schema import validate_and_decide, validate_join_transform, apply_transform
-from generic_parser import parse_item_details, parse_summary, build_invoices
-from sheet_sampler import serialize_raw_grid, sample_join_keys, build_prompt_a, build_prompt_b, build_prompt_c
+from validate_schema import validate_and_decide, apply_transform
+from ingest import normalize_sheet, forward_fill_blocks
+from orchestrator import run_two_sheet_joined, run_single_sheet_grouped_blocks
 
-# Kept as plain strings here (mirrors schema_detection_prompts.md) so the app
-# can assemble copy-ready prompt text without parsing markdown at runtime.
-PROMPT_A_SYSTEM = """You map raw spreadsheet grids to a fixed schema for accounting-voucher import.
-You will be shown the first ~20-25 rows of an Excel sheet as (row, col): value
-pairs. The sheet mixes voucher header rows with inventory-entry (item) rows.
-
-You must map columns to this CLOSED set of canonical field names only —
-never invent a field name, never use one not in this list:
-
-Voucher-level: DATE, VOUCHERNUMBER, PARTYNAME, PARTYGSTIN, NARRATION,
-ROUNDOFFAMOUNT, BILLAMOUNT
-
-Inventory-entry: STOCKITEMNAME, BATCHNAME, EXPIRYDATE, ACTUALQTY, FREEQTY,
-RATE, GSTRATE, AMOUNT, DISCOUNT, TAXABLEVALUE, GSTAMOUNT, HSNCODE, NETAMOUNT
-
-If a canonical field has no matching column in this sheet, omit it from the
-map rather than guessing.
-
-Voucher-level fields on an invoice-header row can appear in TWO different
-ways — check the raw grid carefully for which one applies:
-1. Separate columns — each field sits in its own column index. Use "fields":
-   {"CANONICAL_NAME": col_index, ...}.
-2. One merged cell — Excel merged cells often show up as a single long
-   string in one column with every other column NaN on that row. If you see
-   this pattern, use "blob_extract" instead: {"CANONICAL_NAME": "<regex with
-   a (?P<v>...) named group>", ...}. Never use both on the same marker.
-
-IMPORTANT for merged-cell blobs: leading/trailing whitespace and internal
-spacing inside the blob is unpredictable (it comes from padded Excel
-columns being concatenated). Never anchor a pattern to the start of the
-string with "^" unless you also allow for leading whitespace (e.g. use
-"^\\s*..." not "^..."). Prefer the narrowest pattern that uniquely
-identifies the row — usually just the voucher-number token itself (e.g.
-"PB/\\d+") — over a pattern that tries to match the whole line's shape.
-The same applies inside blob_extract sub-patterns: extract each field with
-a minimal, unanchored regex rather than a full-line template.
-
-Respond with JSON only, matching the schema given."""
-
-PROMPT_A_USER_TEMPLATE = """Sheet name: {sheet_name}
-Paired summary sheet: {summary_sheet_name}
-
-Raw grid (row_index, col_index: value), rows 0-{n}:
-{raw_grid_dump}
-
-Return JSON exactly in this shape:
-{{
-  "sheet_type": "item_details",
-  "header_rows": [<row indices that are column-header labels>],
-  "data_start_row": <first row index containing real voucher/item data>,
-  "invoice_block_marker": {{
-    "column": <col index that holds the voucher number, or the single blob column>,
-    "pattern": "<regex that matches only voucher-number values in that column>",
-    "fields": {{"<canonical voucher field>": <col index>, ...}},
-    "blob_extract": {{"<canonical voucher field>": "<regex with (?P<v>...) group>", ...}}
-  }},
-  "item_row_column_map": {{"<canonical inventory field>": <col index>, ...}},
-  "skip_row_rules": [{{"column": <idx>, "equals": "<literal value to skip, e.g. TOTAL:>"}}],
-  "confidence": <0-1 float, your own estimate of how sure you are>
-}}"""
-
-PROMPT_B_USER_TEMPLATE = """Sheet name: {sheet_name}
-Raw grid (row_index, col_index: value), rows 0-{n}:
-{raw_grid_dump}
-
-Map columns to this CLOSED set only: VOUCHERNUMBER, PARTYNAME, PARTYGSTIN,
-BILLAMOUNT, ROUNDOFFAMOUNT, STATECODE. Omit any field with no matching column.
-
-Return JSON exactly in this shape:
-{{
-  "sheet_type": "consolidated_summary",
-  "header_row": <row index>,
-  "column_map": {{"<canonical field>": <col index>, ...}},
-  "confidence": <0-1 float>
-}}"""
-
-PROMPT_C_USER_TEMPLATE = """Sample VOUCHERNUMBER values from Consolidated Summary: {summary_keys}
-Sample voucher-number values from Item Details: {detail_keys}
-
-Determine how a Consolidated Summary key maps to its Item Details counterpart.
-Respond with JSON using ONLY one of these transform types:
-
-{{"type": "identity"}}
-{{"type": "strip_prefix", "prefix": "<string>"}}
-{{"type": "regex_extract", "from": "summary", "pattern": "<regex with one capture group>", "template": "<output template using {{1}} for the captured group>"}}
-
-Return only the JSON object, nothing else."""
-
-st.set_page_config(page_title="Schema-driven invoice extractor", layout="wide")
-st.title("Schema-driven invoice extractor — test harness")
+st.set_page_config(page_title="Invoice extractor — mapping test harness", layout="wide")
+st.title("Invoice extractor — mapping test harness")
 st.caption(
-    "Paste the schema JSON an LLM detection call would produce (or a hand-written "
-    "one) and test Layer A validation + the deterministic parser against a real file."
+    "One fixed canonical schema, three layout families, per-file mappings pasted in "
+    "(exactly what an LLM detection call would return) until that call is wired in."
 )
 
-EXAMPLE_SCHEMAS = {
-    "Purchase": {
-        "item_details": {
+# ---------------------------------------------------------------------------
+# Example mappings for the three real files already validated end-to-end.
+# ---------------------------------------------------------------------------
+
+EXAMPLES = {
+    "Purchase (two_sheet_joined)": {
+        "layout_type": "two_sheet_joined",
+        "item_mapping": {
             "sheet_type": "item_details", "header_rows": [0, 1], "data_start_row": 3,
             "invoice_block_marker": {
                 "column": 0, "pattern": r"PB/\d+",
                 "blob_extract": {
-                    "DATE": r"^\s*(?P<v>\d{2}-\w{3}-\d{2})",
+                    "DATE": r"(?P<v>\d{2}-[A-Za-z]{3}-\d{2})",
                     "VOUCHERNUMBER": r"(?P<v>PB/\d+)",
                     "PARTYNAME": r"PB/\d+\s+(?P<v>.+?)\s+User",
                 },
@@ -134,10 +48,11 @@ EXAMPLE_SCHEMAS = {
                 "FREEQTY": 9, "RATE": 10, "GSTRATE": 19, "AMOUNT": 21, "DISCOUNT": 13,
                 "GSTAMOUNT": 22, "HSNCODE": 23,
             },
+            "extra_fields": {"MARGIN1": 25, "MARGIN2": 26, "COST": 27},
             "skip_row_rules": [{"column": 2, "equals": "TOTAL:"}],
             "confidence": 0.9,
         },
-        "summary": {
+        "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
             "column_map": {
                 "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
@@ -146,9 +61,12 @@ EXAMPLE_SCHEMAS = {
             "confidence": 0.93,
         },
         "transform": {"type": "identity"},
+        "item_sheet_name": "Item Details",
+        "summary_sheet_name": "Consolidated Summary",
     },
-    "Sales": {
-        "item_details": {
+    "Sales (two_sheet_joined)": {
+        "layout_type": "two_sheet_joined",
+        "item_mapping": {
             "sheet_type": "item_details", "header_rows": [0, 1], "data_start_row": 2,
             "invoice_block_marker": {
                 "column": 2, "pattern": r"S0/\d+",
@@ -165,7 +83,7 @@ EXAMPLE_SCHEMAS = {
             "skip_row_rules": [],
             "confidence": 0.92,
         },
-        "summary": {
+        "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
             "column_map": {
                 "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
@@ -174,151 +92,233 @@ EXAMPLE_SCHEMAS = {
             "confidence": 0.93,
         },
         "transform": {"type": "regex_extract", "pattern": r"-(\d+)$", "template": "S0/{1}"},
+        "item_sheet_name": "Item Details",
+        "summary_sheet_name": "Consolidated Summary",
+    },
+    "GST Summary (single_sheet_grouped_blocks)": {
+        "layout_type": "single_sheet_grouped_blocks",
+        "ingest_mapping": {
+            "block_header_marker": {"columns_present": [0, 1], "columns_blank": [2, 3]},
+            "block_footer_marker": {"column": 0, "contains": "Total"},
+            "forward_fill_columns": {"PARTYNAME": 0, "PARTYGSTIN": 1},
+        },
+        "grouped_mapping": {
+            "sheet_type": "single_sheet_grouped_blocks",
+            "line_identifier_field": "HSNCODE",
+            "column_map": {
+                "PARTYNAME": 0, "PARTYGSTIN": 1, "DATE": 2, "VOUCHERNUMBER": 3, "HSNCODE": 4,
+                "ACTUALQTY": 5, "AMOUNT": 6, "TAXABLEVALUE": 7, "CGSTAMOUNT": 8,
+                "SGSTAMOUNT": 9, "IGSTAMOUNT": 10, "CESSAMOUNT": 11, "GSTAMOUNT": 12,
+            },
+            "extra_fields": {"Is-Cash": 27},
+            "confidence": 0.9,
+        },
+        "sheet_name": "ORIGINAL",
+        "header_row": 6,
     },
 }
 
 with st.sidebar:
     st.header("1. Input")
     uploaded = st.file_uploader("Excel file", type=["xlsx", "xls"])
-    doc_type = st.radio("Load example schema for", ["Purchase", "Sales", "(blank)"], index=2)
-    item_sheet_name = st.text_input("Item Details sheet name", value="Item Details")
-    summary_sheet_name = st.text_input("Consolidated Summary sheet name", value="Consolidated Summary")
+    layout_choice = st.radio(
+        "Layout family",
+        ["two_sheet_joined", "single_sheet_grouped_blocks", "single_sheet_flat"],
+        help=(
+            "two_sheet_joined: Summary + Item Details sheets joined by a key.\n"
+            "single_sheet_grouped_blocks: one sheet, block-header rows needing forward-fill.\n"
+            "single_sheet_flat: one sheet, one row per line item — untested, no sample file yet."
+        ),
+    )
+    example_choice = st.selectbox("Load example mapping", ["(blank)"] + list(EXAMPLES.keys()))
 
-if doc_type in EXAMPLE_SCHEMAS:
-    default_item = json.dumps(EXAMPLE_SCHEMAS[doc_type]["item_details"], indent=2)
-    default_summary = json.dumps(EXAMPLE_SCHEMAS[doc_type]["summary"], indent=2)
-    default_transform = json.dumps(EXAMPLE_SCHEMAS[doc_type]["transform"], indent=2)
-else:
-    default_item = "{}"
-    default_summary = "{}"
-    default_transform = '{"type": "identity"}'
+example = EXAMPLES.get(example_choice)
 
-if uploaded is not None:
-    with st.expander("1a. Generate detection prompts (copy into your LLM call, paste the JSON result below)", expanded=False):
-        item_df_preview = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
-        summary_df_preview = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
+st.header("2. Mapping (paste what an LLM detection call would return)")
 
-        n_rows_item = st.slider("Item Details rows to sample", 10, 40, 25)
-        n_rows_summary = st.slider("Summary rows to sample", 5, 30, 15)
+# ===========================================================================
+# TWO_SHEET_JOINED
+# ===========================================================================
+if layout_choice == "two_sheet_joined":
+    item_sheet_name = st.text_input(
+        "Item Details sheet name",
+        value=example["item_sheet_name"] if example and "item_sheet_name" in example else "Item Details",
+    )
+    summary_sheet_name = st.text_input(
+        "Consolidated Summary sheet name",
+        value=example["summary_sheet_name"] if example and "summary_sheet_name" in example else "Consolidated Summary",
+    )
 
-        prompt_a = build_prompt_a(
-            item_sheet_name, summary_sheet_name, item_df_preview,
-            PROMPT_A_SYSTEM, PROMPT_A_USER_TEMPLATE, n_rows=n_rows_item,
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        item_text = st.text_area(
+            "Item Details mapping", height=380,
+            value=json.dumps(example["item_mapping"], indent=2) if example and "item_mapping" in example else "{}",
         )
-        prompt_b = build_prompt_b(summary_sheet_name, summary_df_preview, PROMPT_B_USER_TEMPLATE, n_rows=n_rows_summary)
+    with col2:
+        summary_text = st.text_area(
+            "Consolidated Summary mapping", height=380,
+            value=json.dumps(example["summary_mapping"], indent=2) if example and "summary_mapping" in example else "{}",
+        )
+    with col3:
+        transform_text = st.text_area(
+            "Join transform", height=150,
+            value=json.dumps(example["transform"], indent=2) if example and "transform" in example else '{"type": "identity"}',
+        )
+        st.caption("type: identity | strip_prefix | regex_extract")
 
-        tab1, tab2, tab3 = st.tabs(["Prompt A — Item Details", "Prompt B — Summary", "Prompt C — join transform"])
-        with tab1:
-            st.caption("System prompt")
-            st.code(prompt_a["system"], language="text")
-            st.caption("User prompt")
-            st.code(prompt_a["user"], language="text")
-        with tab2:
-            st.caption("User prompt")
-            st.code(prompt_b["user"], language="text")
-        with tab3:
-            st.caption("Column + header row for the voucher number in each sheet (used only to sample keys)")
-            cc1, cc2, cc3 = st.columns(3)
-            summary_key_col = cc1.number_input("Summary voucher-number column", min_value=0, value=1, key="ck_summary")
-            detail_key_col = cc2.number_input("Item Details voucher-number column", min_value=0, value=1, key="ck_detail")
-            header_rows_to_skip = cc3.number_input("Rows to skip (header rows)", min_value=0, value=1, key="ck_skip")
-            s_keys = sample_join_keys(summary_df_preview.iloc[header_rows_to_skip:, summary_key_col], n=8)
-            d_keys = sample_join_keys(item_df_preview.iloc[header_rows_to_skip:, detail_key_col], n=8)
-            prompt_c = build_prompt_c(s_keys, d_keys, PROMPT_C_USER_TEMPLATE)
-            st.code(prompt_c["user"], language="text")
+    run = st.button("Run", type="primary", disabled=uploaded is None)
 
-st.header("2. Schema (paste what the LLM detection call would return)")
-col1, col2, col3 = st.columns(3)
-with col1:
-    item_schema_text = st.text_area("Item Details schema", value=default_item, height=380)
-with col2:
-    summary_schema_text = st.text_area("Consolidated Summary schema", value=default_summary, height=380)
-with col3:
-    transform_text = st.text_area("Join transform", value=default_transform, height=150)
-    st.caption("type: identity | strip_prefix | regex_extract")
+    if run and uploaded is not None:
+        try:
+            item_mapping = json.loads(item_text)
+            summary_mapping = json.loads(summary_text)
+            transform = json.loads(transform_text)
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON: {e}")
+            st.stop()
 
-run = st.button("Run Layer A -> parse -> Layer B", type="primary", disabled=uploaded is None)
+        item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
+        summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
+        res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
 
-if run and uploaded is not None:
-    try:
-        item_schema = json.loads(item_schema_text)
-        summary_schema = json.loads(summary_schema_text)
-        transform = json.loads(transform_text)
-    except json.JSONDecodeError as e:
-        st.error(f"Invalid JSON: {e}")
-        st.stop()
-
-    item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
-    summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
-
-    st.header("3. Layer A — schema validation")
-    la_col, lb_col = st.columns(2)
-
-    with la_col:
-        st.subheader("Item Details schema")
-        ok_item, r_item = validate_and_decide(item_schema, item_df.iloc[:25])
-        (st.success if ok_item else st.error)(f"{'PASSED' if ok_item else 'FAILED'}")
-        if r_item.failures:
-            for f in r_item.failures:
+        st.header("3. Layer A")
+        if not res.layer_a_ok:
+            st.error("FAILED")
+            for f in res.layer_a_failures:
                 st.write(f"- {f}")
-        with st.expander("stats"):
-            st.json(r_item.stats)
+            st.stop()
+        st.success("PASSED")
 
-    with lb_col:
-        st.subheader("Consolidated Summary schema")
-        ok_summary, r_summary = validate_and_decide(summary_schema, summary_df.iloc[:15])
-        (st.success if ok_summary else st.error)(f"{'PASSED' if ok_summary else 'FAILED'}")
-        if r_summary.failures:
-            for f in r_summary.failures:
+        report = res.report
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Summary rows", report.total_summary_rows)
+        m2.metric("Join match rate", f"{report.join_match_rate:.1%}")
+        m3.metric("Matched to items", report.matched_invoices)
+        m4.metric("Reconciled", report.reconciled_invoices)
+        m5.metric("Mismatched", report.mismatched_invoices)
+
+        if report.join_match_rate < 0.9:
+            st.error("Join match rate below 90% — check the transform JSON.")
+            with st.expander("Debug: sample keys from both sides", expanded=True):
+                vouchers = None  # already consumed inside run_two_sheet_joined; recompute for display
+                from generic_parser import parse_item_details, parse_summary
+                vouchers = parse_item_details(item_df, item_mapping)
+                summary_rows = parse_summary(summary_df, summary_mapping)
+                summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
+                mapped_sample = [{"summary_key": k, "transform_output": apply_transform(k, transform) if k else None}
+                                  for k in summary_sample]
+                dc1, dc2 = st.columns(2)
+                dc1.dataframe(pd.DataFrame(mapped_sample), use_container_width=True, hide_index=True)
+                dc2.write(list(vouchers.keys())[:10])
+
+        if report.mismatch_detail:
+            st.subheader("Mismatched invoices")
+            st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
+
+        st.header("4. Result")
+        json_str = json.dumps(res.invoices, indent=2, default=str)
+        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json")
+        with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
+            st.json(res.invoices[:5])
+
+# ===========================================================================
+# SINGLE_SHEET_GROUPED_BLOCKS
+# ===========================================================================
+elif layout_choice == "single_sheet_grouped_blocks":
+    sheet_name = st.text_input("Sheet name", value=example["sheet_name"] if example else "ORIGINAL")
+    header_row = st.number_input(
+        "Header row index (0-based)", min_value=0,
+        value=example["header_row"] if example else 0,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ingest_text = st.text_area(
+            "Ingestion mapping (block markers + forward-fill columns)", height=300,
+            value=json.dumps(example["ingest_mapping"], indent=2) if example and "ingest_mapping" in example else "{}",
+        )
+        st.caption("block_header_marker / block_footer_marker / forward_fill_columns")
+    with col2:
+        grouped_text = st.text_area(
+            "Grouped-blocks mapping (column_map into the canonical schema)", height=300,
+            value=json.dumps(example["grouped_mapping"], indent=2) if example and "grouped_mapping" in example else "{}",
+        )
+
+    run = st.button("Run", type="primary", disabled=uploaded is None)
+
+    if run and uploaded is not None:
+        try:
+            ingest_mapping = json.loads(ingest_text)
+            grouped_mapping = json.loads(grouped_text)
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON: {e}")
+            st.stop()
+
+        raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+        res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
+
+        st.header("3. Layer A")
+        if not res.layer_a_ok:
+            st.error("FAILED")
+            for f in res.layer_a_failures:
                 st.write(f"- {f}")
-        with st.expander("stats"):
-            st.json(r_summary.stats)
+            st.stop()
+        st.success("PASSED")
 
-    if not (ok_item and ok_summary):
-        st.warning("Fix the schema above before parsing — Layer A caught a real problem, not a false alarm.")
-        st.stop()
+        report = res.report
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Invoices parsed", report.total_invoices)
+        m2.metric("Reconciled", report.reconciled_invoices)
+        m3.metric("Mismatched", report.mismatched_invoices)
 
-    st.header("4. Parse (deterministic, no LLM)")
-    vouchers = parse_item_details(item_df, item_schema)
-    summary_rows = parse_summary(summary_df, summary_schema)
-    invoices, report = build_invoices(summary_rows, vouchers, transform)
+        if report.mismatch_detail:
+            st.subheader("Mismatched lines (taxable + tax vs stated amount)")
+            st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Summary rows", report.total_summary_rows)
-    m2.metric("Join match rate", f"{report.join_match_rate:.1%}")
-    m3.metric("Matched to items", report.matched_invoices)
-    m4.metric("Reconciled", report.reconciled_invoices)
-    m5.metric("Mismatched", report.mismatched_invoices)
+        st.header("4. Result")
+        json_str = json.dumps(res.invoices, indent=2, default=str)
+        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json")
+        with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
+            st.json(res.invoices[:5])
 
-    if report.join_match_rate < 0.9:
-        st.error("Join match rate below 90% — the transform likely doesn't fit this file. Check the transform JSON.")
-        with st.expander("Debug: sample keys from both sides", expanded=True):
-            summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
-            detail_sample = list(vouchers.keys())[:10]
-            mapped_sample = [
-                {"summary_key": k, "transform_output": apply_transform(k, transform) if k else None}
-                for k in summary_sample
-            ]
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                st.caption("Summary VOUCHERNUMBER (raw) -> after transform")
-                st.dataframe(pd.DataFrame(mapped_sample), use_container_width=True, hide_index=True)
-            with dc2:
-                st.caption("Item Details voucher keys (as parsed)")
-                st.write(detail_sample)
-            st.caption(
-                "If the 'transform_output' column doesn't look like the Item Details keys on the "
-                "right, the transform JSON is wrong for this file — e.g. a regex_extract transform "
-                "left over from a different example. Purchase-style files usually need "
-                '{"type": "identity"}.'
-            )
+        multi_line = [i for i in res.invoices if len(i["lines"]) > 1]
+        if multi_line:
+            with st.expander(f"Multi-HSN invoices ({len(multi_line)} found) — grouping sanity check"):
+                st.json(multi_line[:3])
 
-    if report.mismatch_detail:
-        st.subheader("Mismatched invoices (items sum + round-off vs bill amount)")
-        st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
-
-    st.header("5. Result")
-    json_str = json.dumps(invoices, indent=2, default=str)
-    st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json")
-    with st.expander(f"Preview ({min(5, len(invoices))} of {len(invoices)} invoices)", expanded=False):
+# ===========================================================================
+# SINGLE_SHEET_FLAT (no sample file yet — stub UI, same shape as the others)
+# ===========================================================================
+else:
+    st.info(
+        "No sample file confirms this layout yet. One row = one line item, with "
+        "voucher-level fields (VOUCHERNUMBER, DATE, PARTYNAME, ...) repeated on every "
+        "row belonging to that voucher. The parser (orchestrator.parse_single_sheet_flat) "
+        "is written to the same pattern as the other two layouts but UNTESTED against a "
+        "real export — paste a mapping below once you have a candidate file."
+    )
+    sheet_name = st.text_input("Sheet name", value="Sheet1")
+    data_start_row = st.number_input("Data start row (0-based)", min_value=0, value=1)
+    flat_text = st.text_area(
+        "Flat-sheet mapping", height=300,
+        value=json.dumps({
+            "voucher_fields_column_map": {"VOUCHERNUMBER": 0, "DATE": 1, "PARTYNAME": 2},
+            "item_row_column_map": {"STOCKITEMNAME": 3, "ACTUALQTY": 4, "RATE": 5, "AMOUNT": 6},
+            "line_identifier_field": "STOCKITEMNAME",
+            "data_start_row": 1,
+        }, indent=2),
+    )
+    run = st.button("Run", type="primary", disabled=uploaded is None)
+    if run and uploaded is not None:
+        try:
+            flat_mapping = json.loads(flat_text)
+            flat_mapping["data_start_row"] = data_start_row
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON: {e}")
+            st.stop()
+        from orchestrator import parse_single_sheet_flat
+        df_raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+        invoices = parse_single_sheet_flat(df_raw, flat_mapping)
+        st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
         st.json(invoices[:5])
