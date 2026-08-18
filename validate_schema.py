@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 NUMERIC_ITEM_FIELDS = {
     "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT",
     "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT",
+    "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
 
 VOUCHER_FIELDS = {
@@ -23,12 +24,14 @@ VOUCHER_FIELDS = {
 ITEM_FIELDS = {
     "STOCKITEMNAME", "BATCHNAME", "EXPIRYDATE", "ACTUALQTY", "FREEQTY",
     "RATE", "GSTRATE", "AMOUNT", "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT",
-    "HSNCODE", "NETAMOUNT",
+    "HSNCODE", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
+LINE_IDENTIFIER_FIELDS = {"STOCKITEMNAME", "HSNCODE"}
 SUMMARY_FIELDS = {
     "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
     "BILLAMOUNT", "ROUNDOFFAMOUNT", "STATECODE",
 }
+GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {"DATE", "PARTYNAME", "PARTYGSTIN", "VOUCHERNUMBER"}
 
 TRANSFORM_TYPES = {"identity", "strip_prefix", "regex_extract"}
 
@@ -192,8 +195,13 @@ def validate_item_details_schema(schema: dict, sample_df: pd.DataFrame) -> Valid
         if not _col_ok(idx, n_cols):
             result.add_failure(f"item_row_column_map[{f}] column {idx} out of range")
 
-    if "STOCKITEMNAME" not in item_map:
-        result.add_failure("item_row_column_map missing required field STOCKITEMNAME")
+    line_id_field = schema.get("line_identifier_field", "STOCKITEMNAME")
+    if line_id_field not in LINE_IDENTIFIER_FIELDS:
+        result.add_failure(
+            f"line_identifier_field must be one of {LINE_IDENTIFIER_FIELDS}, got {line_id_field!r}"
+        )
+    elif line_id_field not in item_map:
+        result.add_failure(f"item_row_column_map missing declared line_identifier_field {line_id_field}")
 
     # numeric field sanity: sample rows below data_start_row, EXCLUDING rows
     # that match the invoice_block_marker (those are header rows, not items,
@@ -284,12 +292,82 @@ def validate_join_transform(transform: dict, summary_keys: list, detail_keys: li
     return result
 
 
+def validate_grouped_blocks_schema(schema: dict, sample_df: pd.DataFrame) -> ValidationResult:
+    """sample_df here is the already-normalized, already-forward-filled
+    detail-row table (output of ingest.forward_fill_blocks), not the raw
+    sheet — block structure has already been resolved by that point, so
+    this only needs to check the flat column_map, same shape of check as
+    validate_summary_schema."""
+    result = ValidationResult(passed=True)
+    n_cols = sample_df.shape[1]
+
+    if schema.get("sheet_type") != "single_sheet_grouped_blocks":
+        result.add_failure(f"unexpected sheet_type: {schema.get('sheet_type')}")
+        return result
+
+    if schema.get("confidence", 0) < MIN_CONFIDENCE:
+        result.add_failure(f"confidence {schema.get('confidence')} below {MIN_CONFIDENCE}")
+
+    col_map = schema.get("column_map", {})
+    unknown = set(col_map) - GROUPED_BLOCK_FIELDS
+    if unknown:
+        result.add_failure(f"column_map uses non-canonical keys: {unknown}")
+    for f, idx in col_map.items():
+        if not _col_ok(idx, n_cols):
+            result.add_failure(f"column_map[{f}] column {idx} out of range")
+
+    if "VOUCHERNUMBER" not in col_map:
+        result.add_failure("column_map missing required field VOUCHERNUMBER")
+
+    line_id_field = schema.get("line_identifier_field", "HSNCODE")
+    if line_id_field not in LINE_IDENTIFIER_FIELDS:
+        result.add_failure(f"line_identifier_field must be one of {LINE_IDENTIFIER_FIELDS}")
+    elif line_id_field not in col_map:
+        result.add_failure(f"column_map missing declared line_identifier_field {line_id_field}")
+
+    numeric_present = NUMERIC_ITEM_FIELDS & set(col_map)
+    for f in numeric_present:
+        idx = col_map[f]
+        if not _col_ok(idx, n_cols):
+            continue
+        non_null = sample_df.iloc[:, idx].dropna()
+        if len(non_null) == 0:
+            continue
+        parseable = pd.to_numeric(non_null, errors="coerce").notna().sum()
+        rate = parseable / len(non_null)
+        result.stats[f"numeric_parse_rate.{f}"] = round(rate, 3)
+        if rate < MIN_NUMERIC_PARSE_RATE:
+            result.add_failure(f"field {f} (col {idx}) only {rate:.0%} numeric-parseable")
+
+    # forward_fill_columns / block markers are consumed by ingest.py before
+    # this ever runs, but a structurally broken one would mean the sample
+    # never went through fill correctly — spot-check PARTYNAME/PARTYGSTIN
+    # (if mapped) are fully populated post-fill, since a leftover blank
+    # here means the block boundaries were wrong upstream.
+    for f in {"PARTYNAME", "PARTYGSTIN"} & set(col_map):
+        idx = col_map[f]
+        if _col_ok(idx, n_cols):
+            blank_rate = sample_df.iloc[:, idx].isna().mean()
+            result.stats[f"post_fill_blank_rate.{f}"] = round(blank_rate, 3)
+            if blank_rate > 0.05:
+                result.add_failure(
+                    f"{f} (col {idx}) still {blank_rate:.0%} blank after forward-fill — "
+                    f"check block_header_marker / forward_fill_columns"
+                )
+
+    return result
+
+
 def validate_and_decide(schema: dict, sample_df: pd.DataFrame):
-    """Entry point: returns (should_cache: bool, result: ValidationResult)."""
+    """Entry point: returns (should_cache: bool, result: ValidationResult).
+    For single_sheet_grouped_blocks, sample_df must already be the output
+    of ingest.forward_fill_blocks(), not the raw sheet."""
     if schema.get("sheet_type") == "item_details":
         r = validate_item_details_schema(schema, sample_df)
     elif schema.get("sheet_type") == "consolidated_summary":
         r = validate_summary_schema(schema, sample_df)
+    elif schema.get("sheet_type") == "single_sheet_grouped_blocks":
+        r = validate_grouped_blocks_schema(schema, sample_df)
     else:
         r = ValidationResult(passed=False, failures=["unrecognized sheet_type"])
     return r.passed, r
