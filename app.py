@@ -12,10 +12,8 @@ isn't part of the schema at all.
 Run with: streamlit run app.py
 """
 import json
-
 import streamlit as st
 import pandas as pd
-import openpyxl
 
 from validate_schema import validate_and_decide, apply_transform
 from ingest import normalize_sheet, forward_fill_blocks
@@ -27,51 +25,6 @@ st.caption(
     "One fixed canonical schema, three layout families, per-file mappings pasted in "
     "(exactly what an LLM detection call would return) until that call is wired in."
 )
-
-# ---------------------------------------------------------------------------
-# Sheet-name resolution — accounting/Tally exports frequently have trailing
-# or inconsistent whitespace in sheet names (e.g. "Item Details " with a
-# trailing space). Resolve case/whitespace-insensitively instead of failing
-# with pandas' exact-match ValueError.
-# ---------------------------------------------------------------------------
-
-def resolve_sheet_name(uploaded_file, requested_name):
-    uploaded_file.seek(0)
-    wb = openpyxl.load_workbook(uploaded_file, read_only=True)
-    names = wb.sheetnames
-    wb.close()
-    uploaded_file.seek(0)
-
-    if requested_name in names:
-        return requested_name
-
-    stripped_map = {n.strip().lower(): n for n in names}
-    key = requested_name.strip().lower()
-    if key in stripped_map:
-        return stripped_map[key]
-
-    raise ValueError(
-        f"Sheet '{requested_name}' not found. Available sheets: {names}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Item-sheet cleanup — fixes two real issues seen in production exports:
-#
-# 1. Inconsistent whitespace before punctuation in marker/total cells, e.g.
-#    'TOTAL :' instead of 'TOTAL:'. This silently breaks exact-match
-#    skip_row_rules (like {"column": 2, "equals": "TOTAL:"}), so the row
-#    gets parsed as a fake item line instead of being skipped — usually
-#    only noticeable on the LAST invoice in the sheet, because a stray
-#    'GRAND TOTAL:' footer row immediately follows it and gets absorbed
-#    into that invoice too, blowing up its reconciliation totals.
-#
-# 2. A workbook-level 'GRAND TOTAL:' row after the last invoice block,
-#    which is not part of any invoice and must never be parsed as one.
-#
-# This is applied BEFORE the mapping/parsing step, so it's independent of
-# whatever a given file's skip_row_rules say.
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Example mappings for the three real files already validated end-to-end.
@@ -96,15 +49,27 @@ EXAMPLES = {
                 "GSTAMOUNT": 22, "HSNCODE": 23,
             },
             "extra_fields": {"MARGIN1": 25, "MARGIN2": 26, "COST": 27},
-            "skip_row_rules": [{"column": 2, "equals": "TOTAL:"}],
+            "skip_row_rules": [
+                {"column": 2, "equals_normalized": "TOTAL:"},
+                {"column": 2, "equals_normalized": "GRAND TOTAL:"},
+            ],
             "confidence": 0.9,
         },
         "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
+            "voucher_type": "Purchase",
+            "footer_marker": {"column": 0, "equals_normalized": "Total :"},
             "column_map": {
-                "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
-                "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8,
+                "DATE": 3, "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
+                "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8, "STATECODE": 32,
+                "REFERENCENUMBER": 4, "REFERENCEDATE": 0,
             },
+            "tax_rate_breakup": [
+                {"GSTRATE": 5, "TAXABLEVALUE": 10, "CGSTAMOUNT": 11, "SGSTAMOUNT": 12, "IGSTAMOUNT": 13},
+                {"GSTRATE": 12, "TAXABLEVALUE": 14, "CGSTAMOUNT": 15, "SGSTAMOUNT": 16, "IGSTAMOUNT": 17},
+                {"GSTRATE": 18, "TAXABLEVALUE": 18, "CGSTAMOUNT": 19, "SGSTAMOUNT": 20, "IGSTAMOUNT": 21},
+                {"GSTRATE": 28, "TAXABLEVALUE": 22, "CGSTAMOUNT": 23, "SGSTAMOUNT": 24, "IGSTAMOUNT": 25},
+            ],
             "confidence": 0.93,
         },
         "transform": {"type": "identity"},
@@ -132,10 +97,18 @@ EXAMPLES = {
         },
         "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
+            "voucher_type": "Sales",
+            "footer_marker": {"column": 0, "equals_normalized": "Total :"},
             "column_map": {
-                "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
-                "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7,
+                "DATE": 0, "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
+                "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7, "STATECODE": 32,
             },
+            "tax_rate_breakup": [
+                {"GSTRATE": 5, "TAXABLEVALUE": 9, "CGSTAMOUNT": 10, "SGSTAMOUNT": 11, "IGSTAMOUNT": 12},
+                {"GSTRATE": 12, "TAXABLEVALUE": 13, "CGSTAMOUNT": 14, "SGSTAMOUNT": 15, "IGSTAMOUNT": 16},
+                {"GSTRATE": 18, "TAXABLEVALUE": 17, "CGSTAMOUNT": 18, "SGSTAMOUNT": 19, "IGSTAMOUNT": 20},
+                {"GSTRATE": 28, "TAXABLEVALUE": 21, "CGSTAMOUNT": 22, "SGSTAMOUNT": 23, "IGSTAMOUNT": 24},
+            ],
             "confidence": 0.93,
         },
         "transform": {"type": "regex_extract", "pattern": r"-(\d+)$", "template": "S0/{1}"},
@@ -225,16 +198,8 @@ if layout_choice == "two_sheet_joined":
             st.error(f"Invalid JSON: {e}")
             st.stop()
 
-        try:
-            resolved_item_sheet = resolve_sheet_name(uploaded, item_sheet_name)
-            resolved_summary_sheet = resolve_sheet_name(uploaded, summary_sheet_name)
-        except ValueError as e:
-            st.error(str(e))
-            st.stop()
-
-        item_df = pd.read_excel(uploaded, sheet_name=resolved_item_sheet, header=None)
-        summary_df = pd.read_excel(uploaded, sheet_name=resolved_summary_sheet, header=None)
-
+        item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
+        summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
         res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
 
         st.header("3. Layer A")
@@ -310,13 +275,7 @@ elif layout_choice == "single_sheet_grouped_blocks":
             st.error(f"Invalid JSON: {e}")
             st.stop()
 
-        try:
-            resolved_sheet = resolve_sheet_name(uploaded, sheet_name)
-        except ValueError as e:
-            st.error(str(e))
-            st.stop()
-
-        raw = pd.read_excel(uploaded, sheet_name=resolved_sheet, header=None)
+        raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
         res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
 
         st.header("3. Layer A")
@@ -378,15 +337,8 @@ else:
         except json.JSONDecodeError as e:
             st.error(f"Invalid JSON: {e}")
             st.stop()
-
-        try:
-            resolved_sheet = resolve_sheet_name(uploaded, sheet_name)
-        except ValueError as e:
-            st.error(str(e))
-            st.stop()
-
         from orchestrator import parse_single_sheet_flat
-        df_raw = pd.read_excel(uploaded, sheet_name=resolved_sheet, header=None)
+        df_raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
         invoices = parse_single_sheet_flat(df_raw, flat_mapping)
         st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
         st.json(invoices[:5])
