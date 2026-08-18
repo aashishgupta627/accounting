@@ -1,6 +1,6 @@
 """
-Orchestrator: dispatches a schema + its file to the right parser, based on
-schema["layout_type"]. This is the "which tool do we call" decision the
+Orchestrator: dispatches a mapping + its file to the right parser, based on
+mapping["layout_type"]. This is the "which tool do we call" decision the
 Prompt 0 classification call is meant to answer (see notes at bottom) — but
 the set of tools itself is small and fixed, written once per family, not
 once per vendor. A new vendor with an already-known layout_type needs a new
@@ -22,7 +22,7 @@ Currently supported layout_type values:
                                a real export.
 
 Adding a genuinely new family (not just a new vendor) means writing one
-new parse_<family>() function here and one new validate_<family>_schema()
+new parse_<family>() function here and one new validate_<family>_mapping()
 in validate_schema.py — everything else (Layer A/B, the Streamlit harness,
 the prompt-generation helpers) stays as-is.
 """
@@ -49,47 +49,49 @@ class RunResult:
     report: object = None  # LayerBReport or GroupedBlocksReport, family-specific
 
 
-def run_two_sheet_joined(item_df_raw, summary_df_raw, item_schema, summary_schema, transform):
+def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapping, transform):
     item_sample = item_df_raw.iloc[:25]
     summary_sample = summary_df_raw.iloc[:15]
-    ok_item, r_item = validate_and_decide(item_schema, item_sample)
-    ok_summary, r_summary = validate_and_decide(summary_schema, summary_sample)
+    ok_item, r_item = validate_and_decide(item_mapping, item_sample)
+    ok_summary, r_summary = validate_and_decide(summary_mapping, summary_sample)
     if not (ok_item and ok_summary):
         return RunResult(
             "two_sheet_joined", [], False,
             r_item.failures + r_summary.failures,
         )
-    vouchers = parse_item_details(item_df_raw, item_schema)
-    summary_rows = parse_summary(summary_df_raw, summary_schema)
-    invoices, report = build_invoices(summary_rows, vouchers, transform)
+    vouchers = parse_item_details(item_df_raw, item_mapping)
+    summary_rows = parse_summary(summary_df_raw, summary_mapping)
+    voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
+    invoices, report = build_invoices(summary_rows, vouchers, transform, voucher_type=voucher_type)
     return RunResult("two_sheet_joined", invoices, True, [], report)
 
 
-def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_schema, grouped_schema, header_row=None):
+def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mapping, header_row=None):
     norm = normalize_sheet(sheet_df_raw)
     data_region = norm.iloc[header_row + 1:].reset_index(drop=True) if header_row is not None else norm
-    filled = forward_fill_blocks(data_region, ingest_schema)
+    filled = forward_fill_blocks(data_region, ingest_mapping)
 
-    ok, r = validate_and_decide(grouped_schema, filled.iloc[:60])
+    ok, r = validate_and_decide(grouped_mapping, filled.iloc[:60])
     if not ok:
         return RunResult("single_sheet_grouped_blocks", [], False, r.failures)
 
-    invoices = parse_grouped_blocks(filled, grouped_schema)
+    invoices = parse_grouped_blocks(filled, grouped_mapping)
     report = reconcile_grouped_blocks(invoices)
     return RunResult("single_sheet_grouped_blocks", invoices, True, [], report)
 
 
-def parse_single_sheet_flat(df_raw: pd.DataFrame, schema: dict) -> list:
+def parse_single_sheet_flat(df_raw: pd.DataFrame, mapping: dict) -> list:
     """UNTESTED against a real file — written to the same shape as the
     other two parsers so it's ready the moment a matching sample shows up.
     One row = one line item; voucher-level fields (VOUCHERNUMBER, DATE,
     PARTYNAME, ...) repeat on every row belonging to that voucher, so
     grouping is just 'consecutive rows with the same VOUCHERNUMBER'."""
-    voucher_fields_map = schema["voucher_fields_column_map"]
-    item_map = schema["item_row_column_map"]
-    line_id_field = schema.get("line_identifier_field", "STOCKITEMNAME")
+    voucher_fields_map = mapping["voucher_fields_column_map"]
+    item_map = mapping["item_row_column_map"]
+    extra_fields = mapping.get("extra_fields", {})
+    line_id_field = mapping.get("line_identifier_field", "STOCKITEMNAME")
     voucher_col = voucher_fields_map["VOUCHERNUMBER"]
-    data_start = schema["data_start_row"]
+    data_start = mapping["data_start_row"]
 
     NUMERIC = {
         "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
@@ -118,6 +120,11 @@ def parse_single_sheet_flat(df_raw: pd.DataFrame, schema: dict) -> list:
             continue
         line = {f: (safe_float(row.iloc[idx]) if f in NUMERIC else safe_str(row.iloc[idx]))
                 for f, idx in item_map.items()}
+        if extra_fields:
+            extra = {name: safe_str(row.iloc[idx]) for name, idx in extra_fields.items()
+                      if safe_str(row.iloc[idx]) is not None}
+            if extra:
+                line["extra"] = extra
         invoices[voucher_no]["lines"].append(line)
 
     return [invoices[k] for k in order]
