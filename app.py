@@ -12,8 +12,11 @@ isn't part of the schema at all.
 Run with: streamlit run app.py
 """
 import json
+import re
+
 import streamlit as st
 import pandas as pd
+import openpyxl
 
 from validate_schema import validate_and_decide, apply_transform
 from ingest import normalize_sheet, forward_fill_blocks
@@ -25,6 +28,81 @@ st.caption(
     "One fixed canonical schema, three layout families, per-file mappings pasted in "
     "(exactly what an LLM detection call would return) until that call is wired in."
 )
+
+# ---------------------------------------------------------------------------
+# Sheet-name resolution — accounting/Tally exports frequently have trailing
+# or inconsistent whitespace in sheet names (e.g. "Item Details " with a
+# trailing space). Resolve case/whitespace-insensitively instead of failing
+# with pandas' exact-match ValueError.
+# ---------------------------------------------------------------------------
+
+def resolve_sheet_name(uploaded_file, requested_name):
+    uploaded_file.seek(0)
+    wb = openpyxl.load_workbook(uploaded_file, read_only=True)
+    names = wb.sheetnames
+    wb.close()
+    uploaded_file.seek(0)
+
+    if requested_name in names:
+        return requested_name
+
+    stripped_map = {n.strip().lower(): n for n in names}
+    key = requested_name.strip().lower()
+    if key in stripped_map:
+        return stripped_map[key]
+
+    raise ValueError(
+        f"Sheet '{requested_name}' not found. Available sheets: {names}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Item-sheet cleanup — fixes two real issues seen in production exports:
+#
+# 1. Inconsistent whitespace before punctuation in marker/total cells, e.g.
+#    'TOTAL :' instead of 'TOTAL:'. This silently breaks exact-match
+#    skip_row_rules (like {"column": 2, "equals": "TOTAL:"}), so the row
+#    gets parsed as a fake item line instead of being skipped — usually
+#    only noticeable on the LAST invoice in the sheet, because a stray
+#    'GRAND TOTAL:' footer row immediately follows it and gets absorbed
+#    into that invoice too, blowing up its reconciliation totals.
+#
+# 2. A workbook-level 'GRAND TOTAL:' row after the last invoice block,
+#    which is not part of any invoice and must never be parsed as one.
+#
+# This is applied BEFORE the mapping/parsing step, so it's independent of
+# whatever a given file's skip_row_rules say.
+# ---------------------------------------------------------------------------
+
+_WS_BEFORE_PUNCT = re.compile(r"\s+([:.])")
+_GRAND_TOTAL_RE = re.compile(r"^\s*GRAND\s+TOTAL\s*:?\s*$", re.IGNORECASE)
+
+
+def clean_item_details_df(df, marker_column=2):
+    """Normalize stray whitespace in marker-column text and drop
+    workbook-level GRAND TOTAL footer rows. Returns a new DataFrame."""
+    df = df.copy()
+
+    def normalize_cell(v):
+        if isinstance(v, str):
+            v = _WS_BEFORE_PUNCT.sub(r"\1", v)  # "TOTAL :" -> "TOTAL:"
+            return v
+        return v
+
+    if marker_column in df.columns:
+        df[marker_column] = df[marker_column].apply(normalize_cell)
+        grand_total_mask = df[marker_column].apply(
+            lambda v: isinstance(v, str) and bool(_GRAND_TOTAL_RE.match(v))
+        )
+        if grand_total_mask.any():
+            st.caption(
+                f"Cleanup: dropped {int(grand_total_mask.sum())} 'GRAND TOTAL' "
+                f"footer row(s) not belonging to any invoice."
+            )
+            df = df[~grand_total_mask].reset_index(drop=True)
+
+    return df
+
 
 # ---------------------------------------------------------------------------
 # Example mappings for the three real files already validated end-to-end.
@@ -178,8 +256,19 @@ if layout_choice == "two_sheet_joined":
             st.error(f"Invalid JSON: {e}")
             st.stop()
 
-        item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
-        summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
+        try:
+            resolved_item_sheet = resolve_sheet_name(uploaded, item_sheet_name)
+            resolved_summary_sheet = resolve_sheet_name(uploaded, summary_sheet_name)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
+        item_df = pd.read_excel(uploaded, sheet_name=resolved_item_sheet, header=None)
+        summary_df = pd.read_excel(uploaded, sheet_name=resolved_summary_sheet, header=None)
+
+        marker_col = item_mapping.get("invoice_block_marker", {}).get("column", 2)
+        item_df = clean_item_details_df(item_df, marker_column=marker_col)
+
         res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
 
         st.header("3. Layer A")
@@ -255,7 +344,13 @@ elif layout_choice == "single_sheet_grouped_blocks":
             st.error(f"Invalid JSON: {e}")
             st.stop()
 
-        raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+        try:
+            resolved_sheet = resolve_sheet_name(uploaded, sheet_name)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
+        raw = pd.read_excel(uploaded, sheet_name=resolved_sheet, header=None)
         res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
 
         st.header("3. Layer A")
@@ -317,8 +412,15 @@ else:
         except json.JSONDecodeError as e:
             st.error(f"Invalid JSON: {e}")
             st.stop()
+
+        try:
+            resolved_sheet = resolve_sheet_name(uploaded, sheet_name)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
         from orchestrator import parse_single_sheet_flat
-        df_raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+        df_raw = pd.read_excel(uploaded, sheet_name=resolved_sheet, header=None)
         invoices = parse_single_sheet_flat(df_raw, flat_mapping)
         st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
         st.json(invoices[:5])
