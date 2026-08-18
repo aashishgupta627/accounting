@@ -1,15 +1,41 @@
 """
-Layer A validation: is a detected schema sane enough to cache and run
-deterministically against the full file?
+Layer A validation: is a detected column MAPPING sane enough to cache and
+run deterministically against the full file?
 
-This never calls an LLM. It only checks the schema's shape against a small
-sample DataFrame (the same rows shown to the detector) and reports pass/fail
-with concrete reasons, so a bad schema gets caught before it silently runs
-against thousands of rows.
+TERMINOLOGY — this distinction matters and is used consistently everywhere
+in this codebase:
+
+  CANONICAL SCHEMA  — fixed, singular, never changes per vendor. The field
+                       sets below (VOUCHER_FIELDS, ITEM_FIELDS,
+                       SUMMARY_FIELDS) ARE the schema. Every file — Purchase,
+                       Sales, a new pharma distributor, anything — maps into
+                       this exact same vocabulary.
+
+  MAPPING           — per-file, and the only thing that varies. It's an
+                       address book: "in THIS spreadsheet, STOCKITEMNAME
+                       sits at column 2." A mapping is detected once per
+                       distinct layout (see the caching design in
+                       orchestrator.py) and reused for every future file
+                       that shares that layout — it is not "a new schema
+                       per vendor."
+
+  EXTRA_FIELDS      — an open, unvalidated bucket inside a mapping for a
+                       vendor's non-accounting extras (MARGIN1, SCM%,
+                       Is-Cash, ...) that aren't part of the canonical
+                       schema at all. Never checked against ITEM_FIELDS,
+                       never required, carried through verbatim.
+
+This module never calls an LLM. It only checks a mapping's shape against a
+small sample DataFrame (the same rows shown to the detector) and reports
+pass/fail with concrete reasons, so a bad mapping gets caught before it
+silently runs against thousands of rows.
 """
 import re
 import pandas as pd
 from dataclasses import dataclass, field
+
+# ---- CANONICAL SCHEMA (fixed — do not extend this per vendor; use
+# extra_fields in the mapping instead) -------------------------------------
 
 NUMERIC_ITEM_FIELDS = {
     "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT",
@@ -20,6 +46,7 @@ NUMERIC_ITEM_FIELDS = {
 VOUCHER_FIELDS = {
     "DATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
     "NARRATION", "ROUNDOFFAMOUNT", "BILLAMOUNT",
+    "REFERENCENUMBER", "REFERENCEDATE",
 }
 ITEM_FIELDS = {
     "STOCKITEMNAME", "BATCHNAME", "EXPIRYDATE", "ACTUALQTY", "FREEQTY",
@@ -28,9 +55,13 @@ ITEM_FIELDS = {
 }
 LINE_IDENTIFIER_FIELDS = {"STOCKITEMNAME", "HSNCODE"}
 SUMMARY_FIELDS = {
-    "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
-    "BILLAMOUNT", "ROUNDOFFAMOUNT", "STATECODE",
+    "DATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
+    "BILLAMOUNT", "ROUNDOFFAMOUNT", "STATECODE", "CESSAMOUNT",
+    "REFERENCENUMBER", "REFERENCEDATE",
 }
+# One rate-bucket in a tax_rate_breakup entry. GSTRATE is a literal number
+# (the slab, e.g. 5), not a column index — everything else IS a column index.
+TAX_BREAKUP_FIELDS = {"TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"}
 GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {"DATE", "PARTYNAME", "PARTYGSTIN", "VOUCHERNUMBER"}
 
 TRANSFORM_TYPES = {"identity", "strip_prefix", "regex_extract"}
@@ -54,6 +85,15 @@ class ValidationResult:
 
 def _col_ok(idx, n_cols):
     return isinstance(idx, int) and 0 <= idx < n_cols
+
+
+def _validate_extra_fields(extra_fields: dict, n_cols: int, result: ValidationResult, label: str):
+    """extra_fields is deliberately NOT checked against any canonical set —
+    that's the point of it. Only structural sanity (column in range) is
+    checked, same bar as any other column reference."""
+    for literal_name, idx in extra_fields.items():
+        if not _col_ok(idx, n_cols):
+            result.add_failure(f"{label}.extra_fields[{literal_name!r}] column {idx} out of range")
 
 
 def apply_transform(key, transform: dict):
@@ -100,29 +140,29 @@ def extract_blob_fields(text, blob_extract: dict):
     return out
 
 
-def validate_item_details_schema(schema: dict, sample_df: pd.DataFrame) -> ValidationResult:
-    """sample_df: raw grid (header=None) covering the same rows shown to the LLM."""
+def validate_item_details_mapping(mapping: dict, sample_df: pd.DataFrame) -> ValidationResult:
+    """sample_df: raw grid (header=None) covering the same rows shown to the detector."""
     result = ValidationResult(passed=True)
     n_cols = sample_df.shape[1]
     n_rows = sample_df.shape[0]
 
-    if schema.get("sheet_type") != "item_details":
-        result.add_failure(f"unexpected sheet_type: {schema.get('sheet_type')}")
+    if mapping.get("sheet_type") != "item_details":
+        result.add_failure(f"unexpected sheet_type: {mapping.get('sheet_type')}")
         return result
 
-    if schema.get("confidence", 0) < MIN_CONFIDENCE:
-        result.add_failure(f"confidence {schema.get('confidence')} below {MIN_CONFIDENCE}")
+    if mapping.get("confidence", 0) < MIN_CONFIDENCE:
+        result.add_failure(f"confidence {mapping.get('confidence')} below {MIN_CONFIDENCE}")
 
     # header_rows / data_start_row in range
-    for r in schema.get("header_rows", []):
+    for r in mapping.get("header_rows", []):
         if not (0 <= r < n_rows):
             result.add_failure(f"header row {r} out of range (0-{n_rows-1})")
-    data_start = schema.get("data_start_row")
+    data_start = mapping.get("data_start_row")
     if data_start is None or not (0 <= data_start < n_rows):
         result.add_failure(f"data_start_row {data_start} out of range")
 
     # invoice_block_marker
-    marker = schema.get("invoice_block_marker", {})
+    marker = mapping.get("invoice_block_marker", {})
     marker_col = marker.get("column")
     pattern = marker.get("pattern")
     marker_fields = marker.get("fields", {})
@@ -185,17 +225,22 @@ def validate_item_details_schema(schema: dict, sample_df: pd.DataFrame) -> Valid
                     f"{len(marker_rows)} sample invoice-header rows"
                 )
 
-    # item_row_column_map
-    item_map = schema.get("item_row_column_map", {})
+    # item_row_column_map (per-file mapping into the fixed ITEM_FIELDS schema)
+    item_map = mapping.get("item_row_column_map", {})
     unknown_item_fields = set(item_map) - ITEM_FIELDS
     if unknown_item_fields:
-        result.add_failure(f"item_row_column_map uses non-canonical keys: {unknown_item_fields}")
+        result.add_failure(
+            f"item_row_column_map uses non-canonical keys: {unknown_item_fields} "
+            f"— put vendor-specific extras in extra_fields instead"
+        )
 
     for f, idx in item_map.items():
         if not _col_ok(idx, n_cols):
             result.add_failure(f"item_row_column_map[{f}] column {idx} out of range")
 
-    line_id_field = schema.get("line_identifier_field", "STOCKITEMNAME")
+    _validate_extra_fields(mapping.get("extra_fields", {}), n_cols, result, "item_details")
+
+    line_id_field = mapping.get("line_identifier_field", "STOCKITEMNAME")
     if line_id_field not in LINE_IDENTIFIER_FIELDS:
         result.add_failure(
             f"line_identifier_field must be one of {LINE_IDENTIFIER_FIELDS}, got {line_id_field!r}"
@@ -229,36 +274,61 @@ def validate_item_details_schema(schema: dict, sample_df: pd.DataFrame) -> Valid
                 )
 
     # skip_row_rules structural check only
-    for rule in schema.get("skip_row_rules", []):
+    for rule in mapping.get("skip_row_rules", []):
         if not _col_ok(rule.get("column"), n_cols):
             result.add_failure(f"skip_row_rules column {rule.get('column')} out of range")
 
     return result
 
 
-def validate_summary_schema(schema: dict, sample_df: pd.DataFrame) -> ValidationResult:
+def validate_summary_mapping(mapping: dict, sample_df: pd.DataFrame) -> ValidationResult:
     result = ValidationResult(passed=True)
     n_cols = sample_df.shape[1]
     n_rows = sample_df.shape[0]
 
-    if schema.get("sheet_type") != "consolidated_summary":
-        result.add_failure(f"unexpected sheet_type: {schema.get('sheet_type')}")
+    if mapping.get("sheet_type") != "consolidated_summary":
+        result.add_failure(f"unexpected sheet_type: {mapping.get('sheet_type')}")
         return result
 
-    if schema.get("confidence", 0) < MIN_CONFIDENCE:
-        result.add_failure(f"confidence {schema.get('confidence')} below {MIN_CONFIDENCE}")
+    if mapping.get("confidence", 0) < MIN_CONFIDENCE:
+        result.add_failure(f"confidence {mapping.get('confidence')} below {MIN_CONFIDENCE}")
 
-    header_row = schema.get("header_row")
+    header_row = mapping.get("header_row")
     if header_row is None or not (0 <= header_row < n_rows):
         result.add_failure(f"header_row {header_row} out of range")
 
-    col_map = schema.get("column_map", {})
+    col_map = mapping.get("column_map", {})
     unknown = set(col_map) - SUMMARY_FIELDS
     if unknown:
-        result.add_failure(f"column_map uses non-canonical keys: {unknown}")
+        result.add_failure(
+            f"column_map uses non-canonical keys: {unknown} "
+            f"— put vendor-specific extras in extra_fields instead"
+        )
     for f, idx in col_map.items():
         if not _col_ok(idx, n_cols):
             result.add_failure(f"column_map[{f}] column {idx} out of range")
+
+    _validate_extra_fields(mapping.get("extra_fields", {}), n_cols, result, "consolidated_summary")
+
+    tax_breakup = mapping.get("tax_rate_breakup", [])
+    for i, bucket in enumerate(tax_breakup):
+        if "GSTRATE" not in bucket:
+            result.add_failure(f"tax_rate_breakup[{i}] missing literal GSTRATE")
+        unknown_bucket_fields = set(bucket) - TAX_BREAKUP_FIELDS - {"GSTRATE"}
+        if unknown_bucket_fields:
+            result.add_failure(f"tax_rate_breakup[{i}] uses non-canonical keys: {unknown_bucket_fields}")
+        for f in TAX_BREAKUP_FIELDS & set(bucket):
+            idx = bucket[f]
+            if not _col_ok(idx, n_cols):
+                result.add_failure(f"tax_rate_breakup[{i}][{f}] column {idx} out of range")
+            else:
+                non_null = sample_df.iloc[:, idx].dropna()
+                if len(non_null) > 0:
+                    rate = pd.to_numeric(non_null, errors="coerce").notna().sum() / len(non_null)
+                    if rate < MIN_NUMERIC_PARSE_RATE:
+                        result.add_failure(
+                            f"tax_rate_breakup[{i}][{f}] (col {idx}) only {rate:.0%} numeric-parseable"
+                        )
 
     if "VOUCHERNUMBER" not in col_map:
         result.add_failure("column_map missing required field VOUCHERNUMBER")
@@ -292,34 +362,39 @@ def validate_join_transform(transform: dict, summary_keys: list, detail_keys: li
     return result
 
 
-def validate_grouped_blocks_schema(schema: dict, sample_df: pd.DataFrame) -> ValidationResult:
+def validate_grouped_blocks_mapping(mapping: dict, sample_df: pd.DataFrame) -> ValidationResult:
     """sample_df here is the already-normalized, already-forward-filled
     detail-row table (output of ingest.forward_fill_blocks), not the raw
     sheet — block structure has already been resolved by that point, so
     this only needs to check the flat column_map, same shape of check as
-    validate_summary_schema."""
+    validate_summary_mapping."""
     result = ValidationResult(passed=True)
     n_cols = sample_df.shape[1]
 
-    if schema.get("sheet_type") != "single_sheet_grouped_blocks":
-        result.add_failure(f"unexpected sheet_type: {schema.get('sheet_type')}")
+    if mapping.get("sheet_type") != "single_sheet_grouped_blocks":
+        result.add_failure(f"unexpected sheet_type: {mapping.get('sheet_type')}")
         return result
 
-    if schema.get("confidence", 0) < MIN_CONFIDENCE:
-        result.add_failure(f"confidence {schema.get('confidence')} below {MIN_CONFIDENCE}")
+    if mapping.get("confidence", 0) < MIN_CONFIDENCE:
+        result.add_failure(f"confidence {mapping.get('confidence')} below {MIN_CONFIDENCE}")
 
-    col_map = schema.get("column_map", {})
+    col_map = mapping.get("column_map", {})
     unknown = set(col_map) - GROUPED_BLOCK_FIELDS
     if unknown:
-        result.add_failure(f"column_map uses non-canonical keys: {unknown}")
+        result.add_failure(
+            f"column_map uses non-canonical keys: {unknown} "
+            f"— put vendor-specific extras in extra_fields instead"
+        )
     for f, idx in col_map.items():
         if not _col_ok(idx, n_cols):
             result.add_failure(f"column_map[{f}] column {idx} out of range")
 
+    _validate_extra_fields(mapping.get("extra_fields", {}), n_cols, result, "single_sheet_grouped_blocks")
+
     if "VOUCHERNUMBER" not in col_map:
         result.add_failure("column_map missing required field VOUCHERNUMBER")
 
-    line_id_field = schema.get("line_identifier_field", "HSNCODE")
+    line_id_field = mapping.get("line_identifier_field", "HSNCODE")
     if line_id_field not in LINE_IDENTIFIER_FIELDS:
         result.add_failure(f"line_identifier_field must be one of {LINE_IDENTIFIER_FIELDS}")
     elif line_id_field not in col_map:
@@ -358,16 +433,23 @@ def validate_grouped_blocks_schema(schema: dict, sample_df: pd.DataFrame) -> Val
     return result
 
 
-def validate_and_decide(schema: dict, sample_df: pd.DataFrame):
+def validate_and_decide(mapping: dict, sample_df: pd.DataFrame):
     """Entry point: returns (should_cache: bool, result: ValidationResult).
     For single_sheet_grouped_blocks, sample_df must already be the output
     of ingest.forward_fill_blocks(), not the raw sheet."""
-    if schema.get("sheet_type") == "item_details":
-        r = validate_item_details_schema(schema, sample_df)
-    elif schema.get("sheet_type") == "consolidated_summary":
-        r = validate_summary_schema(schema, sample_df)
-    elif schema.get("sheet_type") == "single_sheet_grouped_blocks":
-        r = validate_grouped_blocks_schema(schema, sample_df)
+    if mapping.get("sheet_type") == "item_details":
+        r = validate_item_details_mapping(mapping, sample_df)
+    elif mapping.get("sheet_type") == "consolidated_summary":
+        r = validate_summary_mapping(mapping, sample_df)
+    elif mapping.get("sheet_type") == "single_sheet_grouped_blocks":
+        r = validate_grouped_blocks_mapping(mapping, sample_df)
     else:
         r = ValidationResult(passed=False, failures=["unrecognized sheet_type"])
     return r.passed, r
+
+
+# Backward-compatible aliases (old names, in case anything still imports
+# them directly) — prefer the *_mapping names above in new code.
+validate_item_details_schema = validate_item_details_mapping
+validate_summary_schema = validate_summary_mapping
+validate_grouped_blocks_schema = validate_grouped_blocks_mapping
