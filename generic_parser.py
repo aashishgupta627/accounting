@@ -68,9 +68,10 @@ def parse_item_details(df_raw: pd.DataFrame, schema: dict) -> dict:
         if current_key is None:
             continue
 
-        item_name_col = item_map.get("STOCKITEMNAME")
-        item_name = safe_str(row.iloc[item_name_col]) if item_name_col is not None else None
-        if not item_name:
+        line_id_field = schema.get("line_identifier_field", "STOCKITEMNAME")
+        line_id_col = item_map.get(line_id_field)
+        line_id_val = safe_str(row.iloc[line_id_col]) if line_id_col is not None else None
+        if not line_id_val:
             continue
 
         item = {}
@@ -140,6 +141,89 @@ def _item_net(item: dict) -> float:
     if "AMOUNT" in item and "GSTAMOUNT" in item:
         return item["AMOUNT"] + item["GSTAMOUNT"]
     return item.get("AMOUNT", 0.0)
+
+
+def parse_grouped_blocks(df_filled: pd.DataFrame, schema: dict) -> list:
+    """df_filled: output of ingest.forward_fill_blocks() — already flat,
+    already forward-filled, header/footer rows already dropped. Groups
+    consecutive rows sharing VOUCHERNUMBER into one invoice (a voucher can
+    span multiple HSN lines, as in GST-2627-001292 spanning 3 HSN codes)."""
+    col_map = schema["column_map"]
+    voucher_col = col_map["VOUCHERNUMBER"]
+
+    NUMERIC = {
+        "ACTUALQTY", "AMOUNT", "TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT",
+        "IGSTAMOUNT", "CESSAMOUNT", "GSTAMOUNT", "GSTRATE", "RATE", "NETAMOUNT", "DISCOUNT",
+    }
+
+    invoices = {}
+    order = []
+    for i in range(len(df_filled)):
+        row = df_filled.iloc[i]
+        voucher_no = row.iloc[voucher_col]
+        if pd.isna(voucher_no):
+            continue
+        voucher_no = str(voucher_no).strip()
+
+        if voucher_no not in invoices:
+            invoices[voucher_no] = {"VOUCHERNUMBER": voucher_no, "lines": []}
+            for f in ("PARTYNAME", "PARTYGSTIN", "DATE"):
+                if f in col_map:
+                    invoices[voucher_no][f] = safe_str(row.iloc[col_map[f]])
+            order.append(voucher_no)
+
+        line = {}
+        for f, idx in col_map.items():
+            if f in {"VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN", "DATE"}:
+                continue
+            val = row.iloc[idx]
+            line[f] = safe_float(val) if f in NUMERIC else safe_str(val)
+        invoices[voucher_no]["lines"].append(line)
+
+    return [invoices[k] for k in order]
+
+
+@dataclass
+class GroupedBlocksReport:
+    total_invoices: int = 0
+    reconciled_invoices: int = 0
+    mismatched_invoices: int = 0
+    mismatch_detail: list = field(default_factory=list)
+
+
+def reconcile_grouped_blocks(invoices: list, tolerance: float = 1.0) -> GroupedBlocksReport:
+    """No join step needed here (single sheet) — the check instead is:
+    does sum(TAXABLEVALUE + GST components) across an invoice's lines land
+    on a sane total? There's no separate 'Tot-Amt.' summary row to compare
+    against per invoice in this file (Tot-Amt. is itself per-HSN-line, same
+    grain as the lines), so this checks the invoice's own internal
+    consistency: taxable + tax components == line's stated Tot-Amt., summed
+    across lines. Any input file with an actual separate voucher-level
+    total would compare against that instead — same pattern as build_invoices."""
+    report = GroupedBlocksReport(total_invoices=len(invoices))
+    for inv in invoices:
+        ok = True
+        for line in inv["lines"]:
+            taxable = line.get("TAXABLEVALUE", 0.0)
+            tax = (
+                line.get("CGSTAMOUNT", 0.0) + line.get("SGSTAMOUNT", 0.0)
+                + line.get("IGSTAMOUNT", 0.0) + line.get("CESSAMOUNT", 0.0)
+            )
+            stated_total = line.get("AMOUNT", 0.0)
+            if stated_total and abs((taxable + tax) - stated_total) > tolerance:
+                ok = False
+                report.mismatch_detail.append({
+                    "VOUCHERNUMBER": inv["VOUCHERNUMBER"],
+                    "HSNCODE": line.get("HSNCODE"),
+                    "taxable_plus_tax": round(taxable + tax, 2),
+                    "stated_amount": stated_total,
+                    "difference": round(abs((taxable + tax) - stated_total), 2),
+                })
+        if ok:
+            report.reconciled_invoices += 1
+        else:
+            report.mismatched_invoices += 1
+    return report
 
 
 @dataclass
