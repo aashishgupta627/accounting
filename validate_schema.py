@@ -59,6 +59,7 @@ SUMMARY_FIELDS = {
     "BILLAMOUNT", "ROUNDOFFAMOUNT", "STATECODE", "CESSAMOUNT",
     "REFERENCENUMBER", "REFERENCEDATE",
 }
+VOUCHER_TYPES_KNOWN = {"Purchase", "Sales", "Credit Note", "Debit Note"}  # informational only — not enforced as a closed set
 # One rate-bucket in a tax_rate_breakup entry. GSTRATE is a literal number
 # (the slab, e.g. 5), not a column index — everything else IS a column index.
 TAX_BREAKUP_FIELDS = {"TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"}
@@ -334,6 +335,32 @@ def validate_summary_mapping(mapping: dict, sample_df: pd.DataFrame) -> Validati
         result.add_failure("column_map missing required field VOUCHERNUMBER")
     if "BILLAMOUNT" not in col_map:
         result.add_failure("column_map missing required field BILLAMOUNT")
+
+    # voucher_number_pattern: a WHITELIST, not a blacklist. Real invoice
+    # numbers follow a predictable shape (S0-26-989, PB/295, ...); footer
+    # and summary-label rows (Total :, SUMMARY, TAXABLE VALUE, GST CESS
+    # VALUE, a repeated header row, ...) never do. Checking "does this look
+    # like a real voucher number" catches ALL of those in one shot, present
+    # and future, instead of blocklisting each label as it's discovered.
+    vnp = mapping.get("voucher_number_pattern")
+    if vnp is not None:
+        try:
+            compiled_vnp = re.compile(vnp)
+        except re.error as e:
+            result.add_failure(f"voucher_number_pattern invalid regex: {e}")
+            compiled_vnp = None
+        if compiled_vnp and "VOUCHERNUMBER" in col_map:
+            idx = col_map["VOUCHERNUMBER"]
+            if _col_ok(idx, n_cols):
+                col_vals = sample_df.iloc[:, idx].dropna().astype(str)
+                if len(col_vals) > 0:
+                    match_rate = col_vals.str.match(compiled_vnp).mean()
+                    result.stats["voucher_number_pattern_match_rate"] = round(match_rate, 3)
+                    if match_rate < 0.5:
+                        result.add_failure(
+                            f"voucher_number_pattern matched only {match_rate:.0%} of sample "
+                            f"VOUCHERNUMBER values — likely the wrong pattern for this file"
+                        )
 
     return result
 
