@@ -9,6 +9,7 @@ code here.
 
 No LLM calls happen here. This module is intentionally boring.
 """
+import re
 import pandas as pd
 from dataclasses import dataclass, field
 from validate_schema import apply_transform, extract_blob_fields, validate_join_transform
@@ -95,6 +96,16 @@ def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
         if not line_id_val:
             continue
 
+        # Structural validity check, not text matching: a real item row has
+        # at least one populated numeric column (qty/rate/amount/...); a
+        # subtotal/label row like 'TOTAL :' or 'GRAND TOTAL:' sitting in the
+        # item-name column position has text there but every numeric column
+        # blank. This catches ANY such label — present or future — without
+        # needing to know its exact wording, unlike skip_row_rules.
+        numeric_cols_in_map = [idx for f, idx in item_map.items() if f in NUMERIC_LINE_FIELDS]
+        if numeric_cols_in_map and not any(pd.notna(row.iloc[idx]) for idx in numeric_cols_in_map):
+            continue
+
         item = {}
         for field_name, idx in item_map.items():
             val = row.iloc[idx]
@@ -149,6 +160,8 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
     extra_fields = mapping.get("extra_fields", {})
     tax_rate_breakup = mapping.get("tax_rate_breakup", [])
     footer_marker = mapping.get("footer_marker")
+    voucher_number_pattern = mapping.get("voucher_number_pattern")
+    compiled_vnp = re.compile(voucher_number_pattern) if voucher_number_pattern else None
     voucher_col = col_map["VOUCHERNUMBER"]
 
     # Defensive guard against the header row (or a repeated header row
@@ -179,13 +192,24 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
         if pd.isna(voucher_no):
             continue
         voucher_no = str(voucher_no).strip()
-        if not voucher_no or voucher_no.lower().startswith("total"):
+        if not voucher_no:
             continue
-        if voucher_no.replace(".", "", 1).isdigit():
-            # pure-numeric rows are footer/count lines, not voucher numbers
-            continue
-        if header_voucher_label is not None and _normalize_for_match(voucher_no) == header_voucher_label:
-            continue  # this row IS the header (or a repeat of it), not a voucher
+
+        if compiled_vnp is not None:
+            # Whitelist check — this alone rejects header repeats, "Total :"
+            # sentinels, and every summary-label row (TAXABLE VALUE, TAX
+            # VALUE, GST CESS VALUE, ...) in one shot, since none of them
+            # match a real voucher-number shape. The heuristics below stay
+            # as a fallback for mappings that don't supply a pattern.
+            if not compiled_vnp.match(voucher_no):
+                continue
+        else:
+            if voucher_no.lower().startswith("total"):
+                continue
+            if voucher_no.replace(".", "", 1).isdigit():
+                continue  # pure-numeric rows are footer/count lines, not voucher numbers
+            if header_voucher_label is not None and _normalize_for_match(voucher_no) == header_voucher_label:
+                continue  # this row IS the header (or a repeat of it), not a voucher
 
         record = {}
         for field_name, idx in col_map.items():
