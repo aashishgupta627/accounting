@@ -1,23 +1,17 @@
 """
-Mapping-driven deterministic parser.
+Schema-driven deterministic parser.
 
-Takes a MAPPING (per-file column addresses into the fixed canonical schema
-— see validate_schema.py's module docstring for the schema/mapping
-distinction) + the raw DataFrame(s), and produces nested invoice JSON. A
-new vendor sharing an already-known layout needs a new mapping, never new
-code here.
+Takes (item_details schema, summary schema, join transform) + the two raw
+DataFrames, and produces the same kind of nested invoice JSON the original
+script produced — but with every column position and the join rule read
+from the schema instead of hardcoded, so a new vendor layout only requires
+a new schema, not a code change.
 
 No LLM calls happen here. This module is intentionally boring.
 """
 import pandas as pd
 from dataclasses import dataclass, field
 from validate_schema import apply_transform, extract_blob_fields, validate_join_transform
-
-NUMERIC_LINE_FIELDS = {
-    "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
-    "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT",
-    "IGSTAMOUNT", "CESSAMOUNT",
-}
 
 
 def safe_float(value):
@@ -36,31 +30,35 @@ def safe_str(value):
     return s if s else None
 
 
-def _extract_extra(row, extra_fields: dict) -> dict:
-    """extra_fields: {literal_header_text: col_idx}. Values are captured
-    as-is (best-effort string), never validated against the canonical
-    schema — this is exactly the vendor-specific overflow bucket."""
-    if not extra_fields:
-        return {}
-    out = {}
-    for literal_name, idx in extra_fields.items():
-        val = safe_str(row.iloc[idx])
-        if val is not None:
-            out[literal_name] = val
-    return out
+def parse_invoice_date(raw_date):
+    """Normalizes a supplier invoice date to ISO (YYYY-MM-DD) and derives
+    the GST return period fields from it: MONTH ('YYYY-MM') and
+    FINANCIALYEAR ('YYYY-YY', Indian convention: April of year N through
+    March of year N+1). Returns (invoice_date, month, financial_year).
+    If the date can't be parsed, the raw value is kept as-is (so the data
+    isn't silently dropped) and month/financial_year come back as None."""
+    if raw_date is None:
+        return None, None, None
+    dt = pd.to_datetime(str(raw_date), dayfirst=True, errors="coerce")
+    if pd.isna(dt):
+        return safe_str(raw_date), None, None
+    invoice_date = dt.strftime("%Y-%m-%d")
+    month = f"{dt.year:04d}-{dt.month:02d}"
+    fy_start = dt.year if dt.month >= 4 else dt.year - 1
+    financial_year = f"{fy_start}-{str(fy_start + 1)[-2:]}"
+    return invoice_date, month, financial_year
 
 
-def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
+def parse_item_details(df_raw: pd.DataFrame, schema: dict) -> dict:
     """Returns {voucher_key: {voucher-level fields..., 'items': [...]}}."""
-    marker = mapping["invoice_block_marker"]
+    marker = schema["invoice_block_marker"]
     marker_col = marker["column"]
     pattern = marker["pattern"]
     fields_map = marker.get("fields", {})
     blob_extract = marker.get("blob_extract", {})
-    item_map = mapping["item_row_column_map"]
-    extra_fields = mapping.get("extra_fields", {})
-    skip_rules = mapping.get("skip_row_rules", [])
-    data_start = mapping["data_start_row"]
+    item_map = schema["item_row_column_map"]
+    skip_rules = schema.get("skip_row_rules", [])
+    data_start = schema["data_start_row"]
 
     marker_series = df_raw.iloc[:, marker_col].astype(str)
     is_marker_row = marker_series.str.contains(pattern, na=False, regex=True)
@@ -89,111 +87,100 @@ def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
         if current_key is None:
             continue
 
-        line_id_field = mapping.get("line_identifier_field", "STOCKITEMNAME")
+        line_id_field = schema.get("line_identifier_field", "STOCKITEMNAME")
         line_id_col = item_map.get(line_id_field)
         line_id_val = safe_str(row.iloc[line_id_col]) if line_id_col is not None else None
         if not line_id_val:
             continue
 
+        # Structural guard against TOTAL:/TOTAL :/GRAND TOTAL:-style rows
+        # (and any other subtotal/footer line, however it's worded): a
+        # genuine item line always has a recorded quantity, even if it's
+        # 0. Footer/total rows leave every per-item column blank and only
+        # populate the summed AMOUNT/GSTAMOUNT columns. Checking this
+        # structurally -- rather than matching TOTAL text -- means it
+        # doesn't depend on exact wording or whitespace (so it also
+        # catches inconsistencies like a stray space before the colon),
+        # and it won't misfire on a real product whose name happens to
+        # start with "Total" (that item would still carry a real
+        # quantity). skip_row_rules remains available for any other
+        # vendor-specific row-skip conditions a schema needs.
+        qty_col = item_map.get("ACTUALQTY")
+        if qty_col is not None and pd.isna(row.iloc[qty_col]):
+            continue
+
         item = {}
         for field_name, idx in item_map.items():
             val = row.iloc[idx]
-            item[field_name] = safe_float(val) if field_name in NUMERIC_LINE_FIELDS else safe_str(val)
-        extra = _extract_extra(row, extra_fields)
-        if extra:
-            item["extra"] = extra
+            if field_name in {
+                "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT",
+                "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT",
+            }:
+                item[field_name] = safe_float(val)
+            else:
+                item[field_name] = safe_str(val)
         vouchers[current_key]["items"].append(item)
 
     return vouchers
 
 
-def _normalize_for_match(text) -> str:
-    """Uppercase + strip ALL whitespace (not just leading/trailing). Used
-    only for matching skip-row markers, never for stored values — 'TOTAL :'
-    and 'TOTAL:' both normalize to 'TOTAL:', but a real item name like
-    'TAYO TOTAL TAB' normalizes to 'TAYOTOTALTAB', which is NOT equal to
-    'TOTAL:'. This is why the rule is exact-match-after-normalization, not
-    substring-contains — a 'contains TOTAL' rule would wrongly skip that
-    real item row."""
-    return "".join(str(text).upper().split())
-
-
 def _row_matches_skip_rule(row, skip_rules):
     for rule in skip_rules:
         col = rule.get("column")
-        if col is None or col >= len(row):
-            continue
-        val = row.iloc[col]
-        if pd.isna(val):
-            continue
-        if "equals" in rule and str(val).strip() == rule["equals"]:
-            return True
-        if "equals_normalized" in rule and _normalize_for_match(val) == _normalize_for_match(rule["equals_normalized"]):
-            return True
+        expected = rule.get("equals")
+        if col is not None and col < len(row):
+            val = row.iloc[col]
+            if pd.notna(val) and str(val).strip() == expected:
+                return True
     return False
 
 
-def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
-    """Returns a list of row dicts keyed by canonical field name.
-
-    Real accounting-software Summary sheets end with a report-footer block
-    (a 'Total :' sentinel row, then several label rows like TAXABLE VALUE /
-    TAX VALUE / EXEMPTED VALUE / GST CESS VALUE — none of which look like a
-    voucher number by pattern, so they'd otherwise leak through). Rather
-    than blocklisting every footer label we happen to encounter, an
-    optional footer_marker in the mapping stops parsing entirely at the
-    sentinel row — everything after it is guaranteed non-data, whatever it
-    says."""
-    header_row = mapping["header_row"]
-    col_map = mapping["column_map"]
-    extra_fields = mapping.get("extra_fields", {})
-    tax_rate_breakup = mapping.get("tax_rate_breakup", [])
-    footer_marker = mapping.get("footer_marker")
+def parse_summary(df_raw: pd.DataFrame, schema: dict) -> list:
+    """Returns a list of row dicts keyed by canonical field name, skipping
+    header rows and any footer/subtotal/summary rows -- wherever in the
+    sheet they occur."""
+    header_row = schema["header_row"]
+    col_map = schema["column_map"]
     voucher_col = col_map["VOUCHERNUMBER"]
+    party_col = col_map.get("PARTYNAME")
 
     rows = []
     for i in range(header_row + 1, len(df_raw)):
         row = df_raw.iloc[i]
-
-        if footer_marker is not None:
-            fm_col = footer_marker["column"]
-            fm_val = row.iloc[fm_col] if fm_col < len(row) else None
-            if pd.notna(fm_val) and _normalize_for_match(fm_val) == _normalize_for_match(footer_marker["equals_normalized"]):
-                break  # sentinel hit — everything from here on is report footer, not data
-
         voucher_no = row.iloc[voucher_col]
 
         if pd.isna(voucher_no):
             continue
         voucher_no = str(voucher_no).strip()
-        if not voucher_no or voucher_no.lower().startswith("total"):
+        if not voucher_no:
+            continue
+        if voucher_no.lower().startswith("total"):
+            # e.g. "Total :" / "Total No. of Invoice : N" -- a sheet-level
+            # or per-block aggregate row, not an invoice. Skip it (don't
+            # break/stop): some exports place subtotal rows mid-sheet
+            # with real invoices continuing below them, so treating this
+            # as an end-of-data marker would silently drop real data.
             continue
         if voucher_no.replace(".", "", 1).isdigit():
             # pure-numeric rows are footer/count lines, not voucher numbers
             continue
 
+        # Structural guard against the SUMMARY block that follows the
+        # "Total :" row (e.g. "TAXABLE VALUE", "TAX VALUE", "EXEMPTED
+        # VALUE", "GST CESS VALUE"): none of those lines start with
+        # "total", so the check above misses them, and their exact
+        # wording isn't guaranteed to stay the same across exports. What
+        # IS always true: a genuine invoice row has a party attached to
+        # it, and a sheet-level aggregate row never does. Checking that
+        # structurally catches the whole footer block regardless of
+        # label text or where it sits in the sheet.
+        if party_col is not None and pd.isna(row.iloc[party_col]):
+            continue
+
         record = {}
         for field_name, idx in col_map.items():
             val = row.iloc[idx]
-            record[field_name] = safe_float(val) if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT", "CESSAMOUNT"} else safe_str(val)
-
-        if tax_rate_breakup:
-            buckets = []
-            for bucket_map in tax_rate_breakup:
-                rate = bucket_map["GSTRATE"]
-                taxable = safe_float(row.iloc[bucket_map["TAXABLEVALUE"]]) if "TAXABLEVALUE" in bucket_map else 0.0
-                if not taxable:
-                    continue  # this invoice didn't hit this rate slab
-                bucket = {"GSTRATE": rate, "TAXABLEVALUE": taxable}
-                for f in ("CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"):
-                    if f in bucket_map:
-                        bucket[f] = safe_float(row.iloc[bucket_map[f]])
-                buckets.append(bucket)
-            record["tax_breakup"] = buckets
-
-        extra = _extract_extra(row, extra_fields)
-        if extra:
-            record["extra"] = extra
+            record[field_name] = safe_float(val) if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT"} else safe_str(val)
         rows.append(record)
 
     return rows
@@ -202,7 +189,7 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
 def _item_net(item: dict) -> float:
     """Prefer an explicit NETAMOUNT column; otherwise derive it as
     AMOUNT + GSTAMOUNT (pre-tax + tax); otherwise fall back to AMOUNT alone.
-    Which case applies depends entirely on what the mapping's
+    Which case applies depends entirely on what the schema's
     item_row_column_map actually contains for that vendor's layout."""
     if "NETAMOUNT" in item and item["NETAMOUNT"]:
         return item["NETAMOUNT"]
@@ -211,14 +198,18 @@ def _item_net(item: dict) -> float:
     return item.get("AMOUNT", 0.0)
 
 
-def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
+def parse_grouped_blocks(df_filled: pd.DataFrame, schema: dict) -> list:
     """df_filled: output of ingest.forward_fill_blocks() — already flat,
     already forward-filled, header/footer rows already dropped. Groups
     consecutive rows sharing VOUCHERNUMBER into one invoice (a voucher can
     span multiple HSN lines, as in GST-2627-001292 spanning 3 HSN codes)."""
-    col_map = mapping["column_map"]
-    extra_fields = mapping.get("extra_fields", {})
+    col_map = schema["column_map"]
     voucher_col = col_map["VOUCHERNUMBER"]
+
+    NUMERIC = {
+        "ACTUALQTY", "AMOUNT", "TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT",
+        "IGSTAMOUNT", "CESSAMOUNT", "GSTAMOUNT", "GSTRATE", "RATE", "NETAMOUNT", "DISCOUNT",
+    }
 
     invoices = {}
     order = []
@@ -241,13 +232,22 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
             if f in {"VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN", "DATE"}:
                 continue
             val = row.iloc[idx]
-            line[f] = safe_float(val) if f in NUMERIC_LINE_FIELDS else safe_str(val)
-        extra = _extract_extra(row, extra_fields)
-        if extra:
-            line["extra"] = extra
+            line[f] = safe_float(val) if f in NUMERIC else safe_str(val)
         invoices[voucher_no]["lines"].append(line)
 
-    return [invoices[k] for k in order]
+    result = [invoices[k] for k in order]
+    for inv in result:
+        # VOUCHERNUMBER in this layout is already the invoice number
+        # itself (no separate internal-vs-supplier split like Purchase's
+        # PB/xxx), so MONTH/FINANCIALYEAR are derived straight from the
+        # invoice's own DATE column.
+        invoice_date, month, financial_year = parse_invoice_date(inv.get("DATE"))
+        if invoice_date is not None:
+            inv["DATE"] = invoice_date
+        inv["MONTH"] = month
+        inv["FINANCIALYEAR"] = financial_year
+
+    return result
 
 
 @dataclass
@@ -304,13 +304,10 @@ class LayerBReport:
 
 
 def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
-                    tolerance: float = 1.0, voucher_type: str = None):
+                    tolerance: float = 1.0):
     """Joins Summary rows to Item Details vouchers via the transform, builds
     the final nested JSON, and produces a Layer B report so the whole file's
-    trustworthiness is visible at a glance — not just per-row noise.
-    voucher_type ('Purchase' / 'Sales' / ...) is a literal stamped onto
-    every invoice from this file — it isn't a column in the source sheet,
-    it's implied by which file/mapping you're running."""
+    trustworthiness is visible at a glance — not just per-row noise."""
     detail_keys = list(item_vouchers.keys())
     summary_keys = [r.get("VOUCHERNUMBER") for r in summary_rows if r.get("VOUCHERNUMBER")]
 
@@ -349,24 +346,23 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "difference": round(abs(adjusted_sum - expected_total), 2),
                 })
 
-        invoice = {
-            "VOUCHERTYPE": voucher_type,
+        invoice_number = row.get("INVOICENUMBER") or detail.get("INVOICENUMBER")
+        raw_invoice_date = row.get("INVOICEDATE") or detail.get("DATE") or detail.get("INVOICEDATE")
+        invoice_date, month, financial_year = parse_invoice_date(raw_invoice_date)
+
+        invoices.append({
             "VOUCHERNUMBER": voucher_no,
-            "REFERENCENUMBER": row.get("REFERENCENUMBER"),
-            "REFERENCEDATE": row.get("REFERENCEDATE"),
-            "DATE": row.get("DATE") or detail.get("DATE"),
+            "INVOICENUMBER": invoice_number,
+            "INVOICEDATE": invoice_date,
+            "MONTH": month,
+            "FINANCIALYEAR": financial_year,
             "PARTYNAME": row.get("PARTYNAME") or detail.get("PARTYNAME"),
             "PARTYGSTIN": row.get("PARTYGSTIN"),
-            "STATECODE": row.get("STATECODE"),
             "BILLAMOUNT": expected_total,
             "ROUNDOFFAMOUNT": round_off,
-            "tax_breakup": row.get("tax_breakup", []),
             "items": items,
             "items_calculated_total": round(calculated_sum, 2),
             "is_validated": is_valid if items else None,
-        }
-        if row.get("extra"):
-            invoice["extra"] = row["extra"]
-        invoices.append(invoice)
+        })
 
     return invoices, report
