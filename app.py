@@ -102,7 +102,7 @@ EXAMPLES = {
         "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
             "column_map": {
-                "VOUCHERNUMBER": 1, "INVOICENUMBER": 4, "INVOICEDATE": 0,
+                "VOUCHERNUMBER": 1, "REFERENCENUMBER": 4, "REFERENCEDATE": 0,
                 "PARTYGSTIN": 2, "PARTYNAME": 6,
                 "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8,
             },
@@ -134,7 +134,7 @@ EXAMPLES = {
         "summary_mapping": {
             "sheet_type": "consolidated_summary", "header_row": 0,
             "column_map": {
-                "VOUCHERNUMBER": 1, "INVOICENUMBER": 1, "INVOICEDATE": 0,
+                "VOUCHERNUMBER": 1, "DATE": 0,
                 "PARTYNAME": 3, "PARTYGSTIN": 4,
                 "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7,
             },
