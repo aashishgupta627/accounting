@@ -36,11 +36,11 @@ EXAMPLES = {
         "item_mapping": {
             "sheet_type": "item_details", "header_rows": [0, 1], "data_start_row": 3,
             "invoice_block_marker": {
-                "column": 0, "pattern": r"PB/\d+",
+                "column": 0, "pattern": r"[A-Z]{2,4}/\d+",
                 "blob_extract": {
                     "DATE": r"(?P<v>\d{2}-[A-Za-z]{3}-\d{2})",
-                    "VOUCHERNUMBER": r"(?P<v>PB/\d+)",
-                    "PARTYNAME": r"PB/\d+\s+(?P<v>.+?)\s+User",
+                    "VOUCHERNUMBER": r"(?P<v>[A-Z]{2,4}/\d+)",
+                    "PARTYNAME": r"[A-Z]{2,4}/\d+\s+(?P<v>.+?)\s+User",
                 },
             },
             "item_row_column_map": {
@@ -221,6 +221,20 @@ if layout_choice == "two_sheet_joined":
         m3.metric("Matched to items", report.matched_invoices)
         m4.metric("Reconciled", report.reconciled_invoices)
         m5.metric("Mismatched", report.mismatched_invoices)
+
+        no_items = [inv for inv in res.invoices if inv["is_validated"] is None]
+        if no_items:
+            st.info(
+                f"{len(no_items)} invoice(s) have no matched items (is_validated: null) — "
+                f"e.g. return/credit vouchers recorded in Summary but with no Item Details "
+                f"block of their own. Review below to confirm these are expected, not a gap."
+            )
+            with st.expander(f"No-items invoices ({len(no_items)})", expanded=False):
+                st.dataframe(
+                    pd.DataFrame([{"VOUCHERNUMBER": i["VOUCHERNUMBER"], "PARTYNAME": i["PARTYNAME"],
+                                    "BILLAMOUNT": i["BILLAMOUNT"]} for i in no_items]),
+                    use_container_width=True, hide_index=True,
+                )
 
         if report.join_match_rate < 0.9:
             st.error("Join match rate below 90% — check the transform JSON.")
