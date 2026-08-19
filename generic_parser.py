@@ -346,14 +346,24 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "difference": round(abs(adjusted_sum - expected_total), 2),
                 })
 
-        invoice_number = row.get("INVOICENUMBER") or detail.get("INVOICENUMBER")
-        raw_invoice_date = row.get("INVOICEDATE") or detail.get("DATE") or detail.get("INVOICEDATE")
-        invoice_date, month, financial_year = parse_invoice_date(raw_invoice_date)
+        # REFERENCENUMBER/REFERENCEDATE are the canonical fields for a
+        # supplier's actual invoice number/date, distinct from
+        # VOUCHERNUMBER (the internal transaction number some vendors
+        # use for the item-details join, e.g. Purchase's PB/xxx). Where
+        # a mapping doesn't distinguish the two (e.g. Sales, where
+        # VOUCHERNUMBER already IS the invoice number and only DATE is
+        # mapped), fall back to DATE for period derivation.
+        reference_number = row.get("REFERENCENUMBER") or detail.get("REFERENCENUMBER")
+        raw_reference_date = (
+            row.get("REFERENCEDATE") or row.get("DATE")
+            or detail.get("REFERENCEDATE") or detail.get("DATE")
+        )
+        reference_date, month, financial_year = parse_invoice_date(raw_reference_date)
 
         invoices.append({
             "VOUCHERNUMBER": voucher_no,
-            "INVOICENUMBER": invoice_number,
-            "INVOICEDATE": invoice_date,
+            "REFERENCENUMBER": reference_number,
+            "REFERENCEDATE": reference_date,
             "MONTH": month,
             "FINANCIALYEAR": financial_year,
             "PARTYNAME": row.get("PARTYNAME") or detail.get("PARTYNAME"),
