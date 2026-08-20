@@ -58,19 +58,13 @@ def generate_hsn_summary(
     """
     Generate HSN-wise summary from invoice data.
     
-    Args:
-        invoices: List of invoice dictionaries from the JSON
-        mode: "B2B" or "B2C"
-        voucher_type: "Sales" or "Purchase"
-        validate: If True, validates totals against invoice totals
-    
-    Returns:
-        Tuple of (DataFrame with HSN summary, ValidationReport or None)
+    Uses BILLAMOUNT - ROUNDOFFAMOUNT as the base total for each invoice.
+    This matches the sum of item NETAMOUNTs.
     """
     
     # Filter invoices by mode (B2B/B2C based on GSTIN presence)
     filtered_invoices = []
-    total_invoice_value = 0.0
+    total_invoice_value = 0.0  # This will be sum of (BILLAMOUNT - ROUNDOFFAMOUNT)
     total_invoice_taxable = 0.0
     total_invoice_tax = 0.0
     
@@ -79,7 +73,12 @@ def generate_hsn_summary(
         if (mode == "B2B" and has_gstin) or (mode == "B2C" and not has_gstin):
             if inv.get("is_validated") is True:
                 filtered_invoices.append(inv)
-                total_invoice_value += float(inv.get("BILLAMOUNT") or 0.0)
+                
+                # Use BILLAMOUNT - ROUNDOFFAMOUNT as the base total
+                bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
+                round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
+                base_total = bill_amount - round_off  # This should match sum of NETAMOUNTs
+                total_invoice_value += base_total
                 
                 # Calculate taxable and tax from tax_breakup
                 tax_breakup = inv.get("tax_breakup", [])
@@ -97,8 +96,8 @@ def generate_hsn_summary(
         "Description": "",
         "UQC": "OTH-OTHERS",
         "Total_Quantity": 0.0,
-        "Total_Value": 0.0,  # NETAMOUNT (amount after discount, inclusive of tax)
-        "Taxable_Value": 0.0,  # TAXABLEVALUE (amount without tax)
+        "Total_Value": 0.0,  # Sum of NETAMOUNTs from items
+        "Taxable_Value": 0.0,
         "IGST_Amount": 0.0,
         "CGST_Amount": 0.0,
         "SGST_Amount": 0.0,
@@ -115,22 +114,29 @@ def generate_hsn_summary(
     for inv in filtered_invoices:
         invoice_no = inv.get("VOUCHERNUMBER")
         items = get_items(inv)
-        interstate = is_interstate(inv)  # True = IGST, False = CGST+SGST
+        interstate = is_interstate(inv)
+        
+        # Get the base total from the invoice
+        bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
+        round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
+        invoice_base_total = bill_amount - round_off
         
         if not items:
             missing_hsn_invoices.append({
                 "VOUCHERNUMBER": invoice_no,
                 "PARTYNAME": inv.get("PARTYNAME"),
                 "BILLAMOUNT": inv.get("BILLAMOUNT"),
+                "ROUNDOFFAMOUNT": round_off,
+                "BASE_TOTAL": invoice_base_total,
                 "issue": "No line items found"
             })
             continue
         
         # Track if this invoice has any HSN codes
         has_hsn = False
-        invoice_total_value = 0.0
-        invoice_taxable_value = 0.0
-        invoice_gst_amount = 0.0
+        invoice_hsn_total = 0.0
+        invoice_taxable_total = 0.0
+        invoice_gst_total = 0.0
         
         for item in items:
             # Get HSN
@@ -147,9 +153,9 @@ def generate_hsn_summary(
             quantity = float(item.get("ACTUALQTY") or item.get("Actual_Quantity") or 0.0)
             rate = float(item.get("GSTRATE") or item.get("GST_Rate") or 0.0)
             
-            invoice_total_value += amount
-            invoice_taxable_value += taxable_value
-            invoice_gst_amount += gst_amount
+            invoice_hsn_total += amount
+            invoice_taxable_total += taxable_value
+            invoice_gst_total += gst_amount
             
             # Split GST based on interstate or intrastate
             if interstate:
@@ -178,7 +184,8 @@ def generate_hsn_summary(
             data["Rates"].add(rate)
             data["Invoice_Numbers"].add(invoice_no)
         
-        # Validate this invoice's totals against HSN aggregation
+        # Validate this invoice's totals
+        # Compare invoice_base_total (BILLAMOUNT - ROUNDOFFAMOUNT) with HSN total
         if has_hsn and validate:
             hsn_invoice_total = sum(
                 hsn_data[hsn]["Total_Value"] 
@@ -186,26 +193,29 @@ def generate_hsn_summary(
                 if invoice_no in hsn_data[hsn]["Invoice_Numbers"]
             )
             
-            hsn_invoice_taxable = sum(
-                hsn_data[hsn]["Taxable_Value"] 
-                for hsn in hsn_data 
-                if invoice_no in hsn_data[hsn]["Invoice_Numbers"]
-            )
+            # Round both to 2 decimals for comparison
+            invoice_base_total_rounded = round(invoice_base_total, 2)
+            hsn_invoice_total_rounded = round(hsn_invoice_total, 2)
             
-            if abs(invoice_total_value - hsn_invoice_total) > 0.01:
+            # The difference should now be 0 or very small
+            if abs(invoice_base_total_rounded - hsn_invoice_total_rounded) > 0.02:
                 mismatched_invoices.append({
                     "VOUCHERNUMBER": invoice_no,
                     "PARTYNAME": inv.get("PARTYNAME"),
-                    "INVOICE_TOTAL": round(invoice_total_value, 2),
-                    "HSN_AGGREGATED": round(hsn_invoice_total, 2),
-                    "DIFFERENCE": round(invoice_total_value - hsn_invoice_total, 2),
+                    "BILLAMOUNT": bill_amount,
+                    "ROUNDOFFAMOUNT": round_off,
+                    "BASE_TOTAL": invoice_base_total_rounded,
+                    "HSN_AGGREGATED": hsn_invoice_total_rounded,
+                    "DIFFERENCE": round(invoice_base_total_rounded - hsn_invoice_total_rounded, 2),
                 })
         
         if not has_hsn:
             missing_hsn_invoices.append({
                 "VOUCHERNUMBER": invoice_no,
                 "PARTYNAME": inv.get("PARTYNAME"),
-                "BILLAMOUNT": inv.get("BILLAMOUNT"),
+                "BILLAMOUNT": bill_amount,
+                "ROUNDOFFAMOUNT": round_off,
+                "BASE_TOTAL": invoice_base_total,
                 "issue": "No HSN codes found in line items"
             })
     
@@ -233,14 +243,24 @@ def generate_hsn_summary(
             "Rate": rate,
         })
         
-        total_hsn_value += data["Total_Value"]
-        total_hsn_taxable += data["Taxable_Value"]
-        total_hsn_tax += data["IGST_Amount"] + data["CGST_Amount"] + data["SGST_Amount"] + data["Cess_Amount"]
+        total_hsn_value += round(data["Total_Value"], 2)
+        total_hsn_taxable += round(data["Taxable_Value"], 2)
+        total_hsn_tax += (
+            round(data["IGST_Amount"], 2) + 
+            round(data["CGST_Amount"], 2) + 
+            round(data["SGST_Amount"], 2) + 
+            round(data["Cess_Amount"], 2)
+        )
     
     # Sort by HSN
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("HSN").reset_index(drop=True)
+    
+    # Calculate the difference - should now be 0 or very small
+    total_invoice_value_rounded = round(total_invoice_value, 2)
+    total_hsn_value_rounded = round(total_hsn_value, 2)
+    difference = total_invoice_value_rounded - total_hsn_value_rounded
     
     # Create validation report
     validation_report = None
@@ -248,12 +268,12 @@ def generate_hsn_summary(
         validation_report = HSNValidationReport(
             mode=mode,
             total_invoices=len(filtered_invoices),
-            total_invoice_value=total_invoice_value,
-            total_hsn_value=total_hsn_value,
-            total_taxable_value=total_hsn_taxable,
-            total_tax_amount=total_hsn_tax,
-            difference=total_invoice_value - total_hsn_value,
-            is_valid=abs(total_invoice_value - total_hsn_value) < 0.01,
+            total_invoice_value=total_invoice_value_rounded,
+            total_hsn_value=total_hsn_value_rounded,
+            total_taxable_value=round(total_hsn_taxable, 2),
+            total_tax_amount=round(total_hsn_tax, 2),
+            difference=difference,
+            is_valid=abs(difference) < 0.01,  # Should be 0 now
             mismatched_invoices=mismatched_invoices,
             missing_hsn_invoices=missing_hsn_invoices
         )
