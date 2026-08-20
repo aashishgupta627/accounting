@@ -212,11 +212,6 @@ def validate_item_details_mapping(mapping: dict, sample_df: pd.DataFrame) -> Val
             except re.error as e:
                 result.add_failure(f"invoice_block_marker.blob_extract[{f}] invalid regex: {e}")
                 continue
-            # Plain Python loop, not pandas .apply().sum(): on some pandas
-            # versions, summing an EMPTY Series backed by the newer "str"
-            # dtype returns '' instead of 0, which then breaks int(''). A
-            # zero-row match here is itself meaningful (worth reporting),
-            # not a state that should crash Layer A.
             blob_values = marker_rows.iloc[:, marker_col].astype(str).tolist()
             sub_matches = sum(1 for v in blob_values if sub_compiled.search(v))
             result.stats[f"blob_extract_matches.{f}"] = sub_matches
@@ -336,12 +331,6 @@ def validate_summary_mapping(mapping: dict, sample_df: pd.DataFrame) -> Validati
     if "BILLAMOUNT" not in col_map:
         result.add_failure("column_map missing required field BILLAMOUNT")
 
-    # voucher_number_pattern: a WHITELIST, not a blacklist. Real invoice
-    # numbers follow a predictable shape (S0-26-989, PB/295, ...); footer
-    # and summary-label rows (Total :, SUMMARY, TAXABLE VALUE, GST CESS
-    # VALUE, a repeated header row, ...) never do. Checking "does this look
-    # like a real voucher number" catches ALL of those in one shot, present
-    # and future, instead of blocklisting each label as it's discovered.
     vnp = mapping.get("voucher_number_pattern")
     if vnp is not None:
         try:
@@ -441,11 +430,6 @@ def validate_grouped_blocks_mapping(mapping: dict, sample_df: pd.DataFrame) -> V
         if rate < MIN_NUMERIC_PARSE_RATE:
             result.add_failure(f"field {f} (col {idx}) only {rate:.0%} numeric-parseable")
 
-    # forward_fill_columns / block markers are consumed by ingest.py before
-    # this ever runs, but a structurally broken one would mean the sample
-    # never went through fill correctly — spot-check PARTYNAME/PARTYGSTIN
-    # (if mapped) are fully populated post-fill, since a leftover blank
-    # here means the block boundaries were wrong upstream.
     for f in {"PARTYNAME", "PARTYGSTIN"} & set(col_map):
         idx = col_map[f]
         if _col_ok(idx, n_cols):
