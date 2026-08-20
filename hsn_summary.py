@@ -29,6 +29,14 @@ class HSNValidationReport:
     missing_hsn_invoices: List[Dict] = field(default_factory=list)
 
 
+def get_items(invoice: Dict) -> List[Dict]:
+    """Get items from invoice, handling both 'items' and 'lines' keys."""
+    items = invoice.get("items") or invoice.get("lines")
+    if items is None:
+        return []
+    return items
+
+
 def generate_hsn_summary(
     invoices: List[Dict],
     mode: str = "B2B",
@@ -94,9 +102,9 @@ def generate_hsn_summary(
     
     for inv in filtered_invoices:
         invoice_no = inv.get("VOUCHERNUMBER")
-        lines = inv.get("lines", [])
+        items = get_items(inv)
         
-        if not lines:
+        if not items:
             missing_hsn_invoices.append({
                 "VOUCHERNUMBER": invoice_no,
                 "PARTYNAME": inv.get("PARTYNAME"),
@@ -114,19 +122,20 @@ def generate_hsn_summary(
         invoice_igst = 0.0
         invoice_cess = 0.0
         
-        for line in lines:
-            hsn = line.get("HSNCODE")
+        for item in items:
+            # Try multiple possible field names for HSN
+            hsn = item.get("HSNCODE") or item.get("HSN") or item.get("HSN_CODE")
             if not hsn:
                 continue
             
             has_hsn = True
             
-            # Get line amounts
-            amount = float(line.get("AMOUNT") or 0.0)
-            taxable_value = float(line.get("TAXABLEVALUE") or 0.0)
-            gst_amount = float(line.get("GSTAMOUNT") or 0.0)
-            quantity = float(line.get("ACTUALQTY") or 0.0)
-            rate = float(line.get("GSTRATE") or 0.0)
+            # Get line amounts - try multiple field names
+            amount = float(item.get("AMOUNT") or item.get("Item_Amount") or 0.0)
+            taxable_value = float(item.get("TAXABLEVALUE") or item.get("Taxable_Value") or 0.0)
+            gst_amount = float(item.get("GSTAMOUNT") or item.get("GST_Amount") or 0.0)
+            quantity = float(item.get("ACTUALQTY") or item.get("Actual_Quantity") or item.get("QTY") or 0.0)
+            rate = float(item.get("GSTRATE") or item.get("GST_Rate") or 0.0)
             
             invoice_total_value += amount
             invoice_taxable_value += taxable_value
@@ -165,9 +174,12 @@ def generate_hsn_summary(
             invoice_igst += igst_amount
             invoice_cess += cess_amount
             
+            # Get description from item name
+            description = item.get("STOCKITEMNAME") or item.get("Item_Name") or item.get("Description") or ""
+            
             # Aggregate
             data = hsn_data[hsn]
-            data["Description"] = line.get("STOCKITEMNAME", "") or data["Description"]
+            data["Description"] = description or data["Description"]
             data["Total_Quantity"] += quantity
             data["Total_Value"] += amount
             data["Taxable_Value"] += taxable_value
