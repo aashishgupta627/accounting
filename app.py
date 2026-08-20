@@ -2,15 +2,9 @@
 Unified test harness — one app, three layout families, dispatched through
 orchestrator.py exactly the way production would.
 
-TERMINOLOGY (see validate_schema.py's module docstring for the full
-version): the CANONICAL SCHEMA (VOUCHER_FIELDS / ITEM_FIELDS /
-SUMMARY_FIELDS) is fixed and never changes. What you paste into the text
-areas below is a MAPPING — per-file column addresses into that fixed
-schema, plus an open extra_fields bucket for anything vendor-specific that
-isn't part of the schema at all.
-
 Run with: streamlit run app.py
 """
+
 import io
 import json
 import streamlit as st
@@ -19,7 +13,11 @@ import pandas as pd
 from validate_schema import validate_and_decide, apply_transform
 from ingest import normalize_sheet, forward_fill_blocks
 from orchestrator import run_two_sheet_joined, run_single_sheet_grouped_blocks
-from tally_export import generate_tally_sales_export, TallyExportConfig, LEDGER_NAME_ASSUMPTIONS
+from tally_export import (
+    generate_tally_sales_export, 
+    generate_tally_purchase_export,
+    TallyExportConfig,
+)
 
 st.set_page_config(page_title="Invoice extractor — mapping test harness", layout="wide")
 st.title("Invoice extractor — mapping test harness")
@@ -168,7 +166,7 @@ with st.sidebar:
         "Your registered state is a...",
         ["Union Territory (UTGST)", "State (SGST)"],
         index=0,
-        help="Controls whether intrastate tax is posted to 'Output UTGST x%' or 'Output SGST x%' ledgers. Default matches the Chandigarh sample files.",
+        help="Controls whether intrastate tax is posted to 'UTGST' or 'SGST' ledgers.",
     ) == "Union Territory (UTGST)"
     round_off_ledger_name = st.text_input("Round Off ledger name", value="Round Off")
 
@@ -209,15 +207,6 @@ if layout_choice == "two_sheet_joined":
 
     run = st.button("Run", type="primary", disabled=uploaded is None)
 
-    # IMPORTANT: `run` is only True on the exact script-run where the "Run"
-    # button was clicked. Any OTHER button on this page (e.g. "Prepare Tally
-    # Sales vouchers" below) triggers its own full Streamlit rerun, on which
-    # `run` is back to False — so parsing must happen once here and its
-    # result must be stashed in st.session_state, and everything downstream
-    # (Layer A, Result, Tally export) must render FROM session_state rather
-    # than being nested inside `if run:`. Otherwise a click on a later
-    # button makes this whole section disappear, which is exactly the "blank
-    # page" bug this replaces.
     if run and uploaded is not None:
         try:
             item_mapping = json.loads(item_text)
@@ -239,10 +228,9 @@ if layout_choice == "two_sheet_joined":
         st.session_state["ts_summary_mapping"] = summary_mapping
         st.session_state["ts_transform"] = transform
         st.session_state["ts_voucher_type"] = voucher_type
-        st.session_state.pop("tally_export_results", None)  # stale export from a previous Run
+        st.session_state.pop("tally_export_results", None)
 
-    # Render from session_state so this survives reruns triggered by other
-    # buttons on the page (Tally export, download buttons, etc).
+    # Render from session_state
     if st.session_state.get("ts_res") is not None:
         res = st.session_state["ts_res"]
         item_mapping = st.session_state["ts_item_mapping"]
@@ -306,72 +294,51 @@ if layout_choice == "two_sheet_joined":
             st.json(res.invoices[:5])
 
         # -------------------------------------------------------------
-        # 5. Tally voucher export (Sales only, for now)
+        # 5. Tally Voucher Export (Sales OR Purchase)
         # -------------------------------------------------------------
-        st.header("5. Tally voucher export")
-        if voucher_type != "Sales":
-            st.caption(
-                f"This mapping is voucher_type={voucher_type!r} — Tally export is wired up "
-                f"for Sales only right now. Purchase support is next."
-            )
-        else:
+        st.header("5. Tally Voucher Export")
+        
+        config = TallyExportConfig(
+            home_state_is_ut=home_state_is_ut,
+            round_off_ledger_name=round_off_ledger_name,
+        )
+        
+        if voucher_type == "Sales":
             st.caption(
                 "Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
-                "Tally-importable 'Accounting Voucher' rows in the same column shape as "
-                "AccountingVouchers_B2B.xlsx / AccountingVouchers_B2C_Updated.xlsx, and checks "
-                "Dr = Cr at every voucher. Only invoices with is_validated = True are exported."
+                "Tally-importable 'Accounting Voucher' rows. "
+                "Dr: Party, Cr: Sales + Output tax ledgers. "
+                "Only invoices with is_validated = True are exported."
             )
-            if LEDGER_NAME_ASSUMPTIONS:
-                with st.expander("Ledger-naming assumptions not yet confirmed against your masters", expanded=False):
-                    for a in LEDGER_NAME_ASSUMPTIONS:
-                        st.write(f"- {a}")
-
-            export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key="prep_tally_btn")
+            
+            export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key="prep_tally_sales_btn")
             if export_clicked:
-                config = TallyExportConfig(
-                    home_state_is_ut=home_state_is_ut,
-                    round_off_ledger_name=round_off_ledger_name,
-                )
                 st.session_state["tally_export_results"] = generate_tally_sales_export(res.invoices, config)
-
+            
             tally_results = st.session_state.get("tally_export_results")
             if tally_results is not None:
                 for mode in ("B2B", "B2C"):
-                    df_out, rpt = tally_results[mode]
-                    st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Invoices in", rpt.total_invoices_in)
-                    c2.metric("Skipped (not validated)", len(rpt.skipped_not_validated))
-                    c3.metric("Skipped (no tax breakup)", len(rpt.skipped_no_tax_breakup))
-                    c4.metric("Balance mismatches", len(rpt.balance_mismatches))
-
-                    if rpt.balance_mismatches:
-                        st.error("Some vouchers do not balance Dr = Cr — review before importing to Tally.")
-                        st.dataframe(pd.DataFrame(rpt.balance_mismatches), use_container_width=True, hide_index=True)
-
-                    if rpt.gstin_state_mismatches:
-                        with st.expander(f"{mode}: data-quality flags ({len(rpt.gstin_state_mismatches)})"):
-                            st.dataframe(pd.DataFrame(rpt.gstin_state_mismatches), use_container_width=True, hide_index=True)
-
-                    if rpt.skipped_not_validated:
-                        with st.expander(f"{mode}: skipped — is_validated != True ({len(rpt.skipped_not_validated)})"):
-                            st.write(rpt.skipped_not_validated)
-
-                    if not df_out.empty:
-                        st.dataframe(df_out, use_container_width=True, hide_index=True)
-                        buf = io.BytesIO()
-                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                            df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
-                        st.download_button(
-                            f"Download {mode} Tally Sales vouchers (.xlsx)",
-                            data=buf.getvalue(),
-                            file_name=f"TallySalesVouchers_{mode}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"dl_{mode}",
-                        )
-                    else:
-                        st.info(f"No {mode} vouchers to export.")
+                    _display_export_results(tally_results[mode], mode, "Sales")
+        
+        elif voucher_type == "Purchase":
+            st.caption(
+                "Generates Tally-importable 'Accounting Voucher' rows for purchase invoices. "
+                "B2B: Dr = Purchase ledger + Input tax ledgers, Cr = Supplier (full amount). "
+                "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
+                "Only invoices with is_validated = True are exported."
+            )
+            
+            export_clicked = st.button("Prepare Tally Purchase vouchers", type="primary", key="prep_tally_purchase_btn")
+            if export_clicked:
+                st.session_state["tally_export_results"] = generate_tally_purchase_export(res.invoices, config)
+            
+            tally_results = st.session_state.get("tally_export_results")
+            if tally_results is not None:
+                for mode in ("B2B", "B2C"):
+                    _display_export_results(tally_results[mode], mode, "Purchase")
+        
+        else:
+            st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
 
 # ===========================================================================
 # SINGLE_SHEET_GROUPED_BLOCKS
@@ -439,7 +406,7 @@ elif layout_choice == "single_sheet_grouped_blocks":
                 st.json(multi_line[:3])
 
 # ===========================================================================
-# SINGLE_SHEET_FLAT (no sample file yet — stub UI, same shape as the others)
+# SINGLE_SHEET_FLAT
 # ===========================================================================
 else:
     st.info(
@@ -473,3 +440,47 @@ else:
         invoices = parse_single_sheet_flat(df_raw, flat_mapping)
         st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
         st.json(invoices[:5])
+
+
+# ---------------------------------------------------------------------------
+# Helper function for displaying export results
+# ---------------------------------------------------------------------------
+
+def _display_export_results(result: tuple, mode: str, voucher_type: str):
+    """Display Tally export results for a single mode (B2B or B2C)."""
+    df_out, rpt = result
+    
+    st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Invoices in", rpt.total_invoices_in)
+    c2.metric("Skipped (not validated)", len(rpt.skipped_not_validated))
+    c3.metric("Skipped (no tax breakup)", len(rpt.skipped_no_tax_breakup))
+    c4.metric("Balance mismatches", len(rpt.balance_mismatches))
+    
+    if rpt.balance_mismatches:
+        st.error("Some vouchers do not balance Dr = Cr — review before importing to Tally.")
+        st.dataframe(pd.DataFrame(rpt.balance_mismatches), use_container_width=True, hide_index=True)
+    
+    if rpt.gstin_state_mismatches:
+        with st.expander(f"{mode}: data-quality flags ({len(rpt.gstin_state_mismatches)})"):
+            st.dataframe(pd.DataFrame(rpt.gstin_state_mismatches), use_container_width=True, hide_index=True)
+    
+    if rpt.skipped_not_validated:
+        with st.expander(f"{mode}: skipped — is_validated != True ({len(rpt.skipped_not_validated)})"):
+            st.write(rpt.skipped_not_validated)
+    
+    if not df_out.empty:
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
+        st.download_button(
+            f"Download {mode} Tally {voucher_type} vouchers (.xlsx)",
+            data=buf.getvalue(),
+            file_name=f"Tally{voucher_type}Vouchers_{mode}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_{voucher_type}_{mode}",
+        )
+    else:
+        st.info(f"No {mode} {voucher_type} vouchers to export.")
