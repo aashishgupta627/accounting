@@ -18,6 +18,7 @@ from tally_export import (
     generate_tally_purchase_export,
     TallyExportConfig,
 )
+from hsn_summary import generate_all_hsn_summaries, HSNValidationReport
 
 st.set_page_config(page_title="Invoice extractor — mapping test harness", layout="wide")
 st.title("Invoice extractor — mapping test harness")
@@ -274,6 +275,7 @@ if layout_choice == "two_sheet_joined":
         st.session_state["ts_transform"] = transform
         st.session_state["ts_voucher_type"] = voucher_type
         st.session_state.pop("tally_export_results", None)
+        st.session_state.pop("hsn_summaries", None)
 
     # Render from session_state
     if st.session_state.get("ts_res") is not None:
@@ -337,6 +339,67 @@ if layout_choice == "two_sheet_joined":
         st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="dl_json")
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
+
+        # -------------------------------------------------------------
+        # 4.5 HSN Summary Export
+        # -------------------------------------------------------------
+        st.header("4.5 HSN Summary Reports")
+        st.caption(
+            "Generate HSN-wise summary reports for B2B and B2C sales. "
+            "Only invoices with is_validated = True are included."
+        )
+        
+        if voucher_type == "Sales":
+            if st.button("Generate HSN Summaries", type="primary", key="gen_hsn_btn"):
+                summaries = generate_all_hsn_summaries(res.invoices, voucher_type)
+                st.session_state["hsn_summaries"] = summaries
+            
+            if st.session_state.get("hsn_summaries") is not None:
+                summaries = st.session_state["hsn_summaries"]
+                
+                for mode, df in summaries.items():
+                    st.subheader(f"{mode} HSN Summary")
+                    
+                    if df.empty:
+                        st.info(f"No {mode} data available")
+                        continue
+                    
+                    # Display metrics
+                    total_value = df["Total Value"].sum()
+                    total_taxable = df["Taxable Value"].sum()
+                    total_tax = df["Integrated Tax Amount"].sum() + df["Central Tax Amount"].sum() + df["State/UT Tax Amount"].sum()
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric(f"{mode} - Total Value", f"₹{total_value:,.2f}")
+                    c2.metric(f"{mode} - Taxable Value", f"₹{total_taxable:,.2f}")
+                    c3.metric(f"{mode} - Total Tax", f"₹{total_tax:,.2f}")
+                    
+                    # Show the table
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    
+                    # Download button
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        f"Download {mode} HSN Summary (.csv)",
+                        data=csv,
+                        file_name=f"hsn_{mode.lower()}.csv",
+                        mime="text/csv",
+                        key=f"dl_hsn_{mode}",
+                    )
+                    
+                    # Also provide Excel download
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        df.to_excel(writer, sheet_name=f"HSN_{mode}", index=False)
+                    st.download_button(
+                        f"Download {mode} HSN Summary (.xlsx)",
+                        data=buf.getvalue(),
+                        file_name=f"hsn_{mode.lower()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_hsn_excel_{mode}",
+                    )
+        else:
+            st.info(f"HSN summary generation is currently only implemented for Sales vouchers. Voucher type: {voucher_type}")
 
         # -------------------------------------------------------------
         # 5. Tally Voucher Export (Sales OR Purchase)
