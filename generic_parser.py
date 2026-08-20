@@ -96,12 +96,6 @@ def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
         if not line_id_val:
             continue
 
-        # Structural validity check, not text matching: a real item row has
-        # at least one populated numeric column (qty/rate/amount/...); a
-        # subtotal/label row like 'TOTAL :' or 'GRAND TOTAL:' sitting in the
-        # item-name column position has text there but every numeric column
-        # blank. This catches ANY such label — present or future — without
-        # needing to know its exact wording, unlike skip_row_rules.
         numeric_cols_in_map = [idx for f, idx in item_map.items() if f in NUMERIC_LINE_FIELDS]
         if numeric_cols_in_map and not any(pd.notna(row.iloc[idx]) for idx in numeric_cols_in_map):
             continue
@@ -119,13 +113,6 @@ def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
 
 
 def _normalize_for_match(text) -> str:
-    """Uppercase + strip ALL whitespace (not just leading/trailing). Used
-    only for matching skip-row markers, never for stored values — 'TOTAL :'
-    and 'TOTAL:' both normalize to 'TOTAL:', but a real item name like
-    'TAYO TOTAL TAB' normalizes to 'TAYOTOTALTAB', which is NOT equal to
-    'TOTAL:'. This is why the rule is exact-match-after-normalization, not
-    substring-contains — a 'contains TOTAL' rule would wrongly skip that
-    real item row."""
     return "".join(str(text).upper().split())
 
 
@@ -145,16 +132,6 @@ def _row_matches_skip_rule(row, skip_rules):
 
 
 def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
-    """Returns a list of row dicts keyed by canonical field name.
-
-    Real accounting-software Summary sheets end with a report-footer block
-    (a 'Total :' sentinel row, then several label rows like TAXABLE VALUE /
-    TAX VALUE / EXEMPTED VALUE / GST CESS VALUE — none of which look like a
-    voucher number by pattern, so they'd otherwise leak through). Rather
-    than blocklisting every footer label we happen to encounter, an
-    optional footer_marker in the mapping stops parsing entirely at the
-    sentinel row — everything after it is guaranteed non-data, whatever it
-    says."""
     header_row = mapping["header_row"]
     col_map = mapping["column_map"]
     extra_fields = mapping.get("extra_fields", {})
@@ -164,13 +141,6 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
     compiled_vnp = re.compile(voucher_number_pattern) if voucher_number_pattern else None
     voucher_col = col_map["VOUCHERNUMBER"]
 
-    # Defensive guard against the header row (or a repeated header row
-    # elsewhere in the sheet — some exports repeat it for print layout)
-    # leaking through as fake "data": capture the header row's own literal
-    # value at the voucher column, and skip any row that matches it exactly.
-    # This self-heals regardless of WHY a header-like row ended up in the
-    # data range (off-by-one header_row, a duplicated header, etc.) rather
-    # than only fixing the one specific cause.
     header_voucher_label = None
     if 0 <= header_row < len(df_raw):
         raw_header_val = df_raw.iloc[header_row].iloc[voucher_col]
@@ -185,7 +155,7 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
             fm_col = footer_marker["column"]
             fm_val = row.iloc[fm_col] if fm_col < len(row) else None
             if pd.notna(fm_val) and _normalize_for_match(fm_val) == _normalize_for_match(footer_marker["equals_normalized"]):
-                break  # sentinel hit — everything from here on is report footer, not data
+                break
 
         voucher_no = row.iloc[voucher_col]
 
@@ -196,20 +166,15 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
             continue
 
         if compiled_vnp is not None:
-            # Whitelist check — this alone rejects header repeats, "Total :"
-            # sentinels, and every summary-label row (TAXABLE VALUE, TAX
-            # VALUE, GST CESS VALUE, ...) in one shot, since none of them
-            # match a real voucher-number shape. The heuristics below stay
-            # as a fallback for mappings that don't supply a pattern.
             if not compiled_vnp.match(voucher_no):
                 continue
         else:
             if voucher_no.lower().startswith("total"):
                 continue
             if voucher_no.replace(".", "", 1).isdigit():
-                continue  # pure-numeric rows are footer/count lines, not voucher numbers
+                continue
             if header_voucher_label is not None and _normalize_for_match(voucher_no) == header_voucher_label:
-                continue  # this row IS the header (or a repeat of it), not a voucher
+                continue
 
         record = {}
         for field_name, idx in col_map.items():
@@ -222,7 +187,7 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
                 rate = bucket_map["GSTRATE"]
                 taxable = safe_float(row.iloc[bucket_map["TAXABLEVALUE"]]) if "TAXABLEVALUE" in bucket_map else 0.0
                 if not taxable:
-                    continue  # this invoice didn't hit this rate slab
+                    continue
                 bucket = {"GSTRATE": rate, "TAXABLEVALUE": taxable}
                 for f in ("CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"):
                     if f in bucket_map:
@@ -239,10 +204,6 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
 
 
 def _item_net(item: dict) -> float:
-    """Prefer an explicit NETAMOUNT column; otherwise derive it as
-    AMOUNT + GSTAMOUNT (pre-tax + tax); otherwise fall back to AMOUNT alone.
-    Which case applies depends entirely on what the mapping's
-    item_row_column_map actually contains for that vendor's layout."""
     if "NETAMOUNT" in item and item["NETAMOUNT"]:
         return item["NETAMOUNT"]
     if "AMOUNT" in item and "GSTAMOUNT" in item:
@@ -251,10 +212,6 @@ def _item_net(item: dict) -> float:
 
 
 def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
-    """df_filled: output of ingest.forward_fill_blocks() — already flat,
-    already forward-filled, header/footer rows already dropped. Groups
-    consecutive rows sharing VOUCHERNUMBER into one invoice (a voucher can
-    span multiple HSN lines, as in GST-2627-001292 spanning 3 HSN codes)."""
     col_map = mapping["column_map"]
     extra_fields = mapping.get("extra_fields", {})
     voucher_col = col_map["VOUCHERNUMBER"]
@@ -298,14 +255,6 @@ class GroupedBlocksReport:
 
 
 def reconcile_grouped_blocks(invoices: list, tolerance: float = 1.0) -> GroupedBlocksReport:
-    """No join step needed here (single sheet) — the check instead is:
-    does sum(TAXABLEVALUE + GST components) across an invoice's lines land
-    on a sane total? There's no separate 'Tot-Amt.' summary row to compare
-    against per invoice in this file (Tot-Amt. is itself per-HSN-line, same
-    grain as the lines), so this checks the invoice's own internal
-    consistency: taxable + tax components == line's stated Tot-Amt., summed
-    across lines. Any input file with an actual separate voucher-level
-    total would compare against that instead — same pattern as build_invoices."""
     report = GroupedBlocksReport(total_invoices=len(invoices))
     for inv in invoices:
         ok = True
@@ -344,12 +293,6 @@ class LayerBReport:
 
 def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     tolerance: float = 1.0, voucher_type: str = None):
-    """Joins Summary rows to Item Details vouchers via the transform, builds
-    the final nested JSON, and produces a Layer B report so the whole file's
-    trustworthiness is visible at a glance — not just per-row noise.
-    voucher_type ('Purchase' / 'Sales' / ...) is a literal stamped onto
-    every invoice from this file — it isn't a column in the source sheet,
-    it's implied by which file/mapping you're running."""
     detail_keys = list(item_vouchers.keys())
     summary_keys = [r.get("VOUCHERNUMBER") for r in summary_rows if r.get("VOUCHERNUMBER")]
 
