@@ -37,6 +37,18 @@ def get_items(invoice: Dict) -> List[Dict]:
     return items
 
 
+def is_interstate(invoice: Dict) -> bool:
+    """
+    Determine if invoice is interstate (IGST) or intrastate (CGST+SGST).
+    Returns: True if interstate (has IGST), False if intrastate (has CGST+SGST)
+    """
+    tax_breakup = invoice.get("tax_breakup", [])
+    for bucket in tax_breakup:
+        if float(bucket.get("IGSTAMOUNT") or 0.0) > 0:
+            return True
+    return False
+
+
 def generate_hsn_summary(
     invoices: List[Dict],
     mode: str = "B2B",
@@ -85,8 +97,8 @@ def generate_hsn_summary(
         "Description": "",
         "UQC": "OTH-OTHERS",
         "Total_Quantity": 0.0,
-        "Total_Value": 0.0,
-        "Taxable_Value": 0.0,
+        "Total_Value": 0.0,  # NETAMOUNT (amount after discount, inclusive of tax)
+        "Taxable_Value": 0.0,  # TAXABLEVALUE (amount without tax)
         "IGST_Amount": 0.0,
         "CGST_Amount": 0.0,
         "SGST_Amount": 0.0,
@@ -103,6 +115,7 @@ def generate_hsn_summary(
     for inv in filtered_invoices:
         invoice_no = inv.get("VOUCHERNUMBER")
         items = get_items(inv)
+        interstate = is_interstate(inv)  # True = IGST, False = CGST+SGST
         
         if not items:
             missing_hsn_invoices.append({
@@ -117,67 +130,43 @@ def generate_hsn_summary(
         has_hsn = False
         invoice_total_value = 0.0
         invoice_taxable_value = 0.0
-        invoice_cgst = 0.0
-        invoice_sgst = 0.0
-        invoice_igst = 0.0
-        invoice_cess = 0.0
+        invoice_gst_amount = 0.0
         
         for item in items:
-            # Try multiple possible field names for HSN
+            # Get HSN
             hsn = item.get("HSNCODE") or item.get("HSN") or item.get("HSN_CODE")
             if not hsn:
                 continue
             
             has_hsn = True
             
-            # Get line amounts - try multiple field names
-            amount = float(item.get("AMOUNT") or item.get("Item_Amount") or 0.0)
+            # Get values - use NETAMOUNT for Total Value
+            amount = float(item.get("NETAMOUNT") or item.get("AMOUNT") or 0.0)
             taxable_value = float(item.get("TAXABLEVALUE") or item.get("Taxable_Value") or 0.0)
             gst_amount = float(item.get("GSTAMOUNT") or item.get("GST_Amount") or 0.0)
-            quantity = float(item.get("ACTUALQTY") or item.get("Actual_Quantity") or item.get("QTY") or 0.0)
+            quantity = float(item.get("ACTUALQTY") or item.get("Actual_Quantity") or 0.0)
             rate = float(item.get("GSTRATE") or item.get("GST_Rate") or 0.0)
             
             invoice_total_value += amount
             invoice_taxable_value += taxable_value
+            invoice_gst_amount += gst_amount
             
-            # Find the corresponding tax bucket for this HSN/rate
-            tax_breakup = inv.get("tax_breakup", [])
+            # Split GST based on interstate or intrastate
+            if interstate:
+                # Interstate: All GST goes to IGST
+                igst_amount = gst_amount
+                cgst_amount = 0.0
+                sgst_amount = 0.0
+            else:
+                # Intrastate: Split equally between CGST and SGST
+                cgst_amount = gst_amount / 2
+                sgst_amount = gst_amount / 2
+                igst_amount = 0.0
             
-            cgst_amount = 0.0
-            sgst_amount = 0.0
-            igst_amount = 0.0
-            cess_amount = 0.0
+            # Get description
+            description = item.get("STOCKITEMNAME") or item.get("Item_Name") or ""
             
-            # Find the matching tax bucket
-            for bucket in tax_breakup:
-                if bucket.get("GSTRATE") == rate:
-                    bucket_taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
-                    if bucket_taxable > 0:
-                        proportion = taxable_value / bucket_taxable if bucket_taxable > 0 else 0
-                        cgst_amount = float(bucket.get("CGSTAMOUNT") or 0.0) * proportion
-                        sgst_amount = float(bucket.get("SGSTAMOUNT") or 0.0) * proportion
-                        igst_amount = float(bucket.get("IGSTAMOUNT") or 0.0) * proportion
-                        cess_amount = float(bucket.get("CESSAMOUNT") or 0.0) * proportion
-                    break
-            
-            # If no tax breakup found, use line-level GST amount
-            if cgst_amount == 0 and sgst_amount == 0 and igst_amount == 0:
-                has_igst = any(b.get("IGSTAMOUNT", 0) > 0 for b in tax_breakup)
-                if has_igst:
-                    igst_amount = gst_amount
-                else:
-                    cgst_amount = gst_amount / 2
-                    sgst_amount = gst_amount / 2
-            
-            invoice_cgst += cgst_amount
-            invoice_sgst += sgst_amount
-            invoice_igst += igst_amount
-            invoice_cess += cess_amount
-            
-            # Get description from item name
-            description = item.get("STOCKITEMNAME") or item.get("Item_Name") or item.get("Description") or ""
-            
-            # Aggregate
+            # Aggregate by HSN
             data = hsn_data[hsn]
             data["Description"] = description or data["Description"]
             data["Total_Quantity"] += quantity
@@ -186,7 +175,6 @@ def generate_hsn_summary(
             data["IGST_Amount"] += igst_amount
             data["CGST_Amount"] += cgst_amount
             data["SGST_Amount"] += sgst_amount
-            data["Cess_Amount"] += cess_amount
             data["Rates"].add(rate)
             data["Invoice_Numbers"].add(invoice_no)
         
@@ -194,6 +182,12 @@ def generate_hsn_summary(
         if has_hsn and validate:
             hsn_invoice_total = sum(
                 hsn_data[hsn]["Total_Value"] 
+                for hsn in hsn_data 
+                if invoice_no in hsn_data[hsn]["Invoice_Numbers"]
+            )
+            
+            hsn_invoice_taxable = sum(
+                hsn_data[hsn]["Taxable_Value"] 
                 for hsn in hsn_data 
                 if invoice_no in hsn_data[hsn]["Invoice_Numbers"]
             )
