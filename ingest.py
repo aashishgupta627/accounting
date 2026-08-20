@@ -38,7 +38,6 @@ def normalize_sheet(df_raw: pd.DataFrame) -> pd.DataFrame:
         if isinstance(v, str):
             return v.strip()
         return v
-
     return df_raw.apply(lambda col: col.map(clean_cell))
 
 
