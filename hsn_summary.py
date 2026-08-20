@@ -1,95 +1,285 @@
-# Update the HSN Summary section in app.py (around line 420-470)
+"""
+HSN Summary Generator - Creates HSN-wise summary reports from invoice JSON data.
 
-        # -------------------------------------------------------------
-        # 4.5 HSN Summary Export
-        # -------------------------------------------------------------
-        st.header("4.5 HSN Summary Reports")
-        st.caption(
-            "Generate HSN-wise summary reports for B2B and B2C sales. "
-            "Only invoices with is_validated = True are included. "
-            "Reports include validation to ensure totals match invoice data."
-        )
-        
-        if voucher_type == "Sales":
-            if st.button("Generate HSN Summaries", type="primary", key="gen_hsn_btn"):
-                summaries = generate_all_hsn_summaries(res.invoices, voucher_type, validate=True)
-                st.session_state["hsn_summaries"] = summaries
-            
-            if st.session_state.get("hsn_summaries") is not None:
-                summaries = st.session_state["hsn_summaries"]
+Generates reports in the same format as the sample CSV files:
+- B2B HSN summary
+- B2C HSN summary
+
+Includes validation to ensure HSN summary totals match invoice totals.
+"""
+
+import pandas as pd
+from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class HSNValidationReport:
+    """Report of HSN summary validation results."""
+    mode: str = ""
+    total_invoices: int = 0
+    total_invoice_value: float = 0.0
+    total_hsn_value: float = 0.0
+    total_taxable_value: float = 0.0
+    total_tax_amount: float = 0.0
+    difference: float = 0.0
+    is_valid: bool = True
+    mismatched_invoices: List[Dict] = field(default_factory=list)
+    missing_hsn_invoices: List[Dict] = field(default_factory=list)
+
+
+def generate_hsn_summary(
+    invoices: List[Dict],
+    mode: str = "B2B",
+    voucher_type: str = "Sales",
+    validate: bool = True
+) -> Tuple[pd.DataFrame, Optional[HSNValidationReport]]:
+    """
+    Generate HSN-wise summary from invoice data.
+    
+    Args:
+        invoices: List of invoice dictionaries from the JSON
+        mode: "B2B" or "B2C"
+        voucher_type: "Sales" or "Purchase"
+        validate: If True, validates totals against invoice totals
+    
+    Returns:
+        Tuple of (DataFrame with HSN summary, ValidationReport or None)
+    """
+    
+    # Filter invoices by mode (B2B/B2C based on GSTIN presence)
+    filtered_invoices = []
+    total_invoice_value = 0.0
+    total_invoice_taxable = 0.0
+    total_invoice_tax = 0.0
+    
+    for inv in invoices:
+        has_gstin = bool(inv.get("PARTYGSTIN") and str(inv.get("PARTYGSTIN")).strip())
+        if (mode == "B2B" and has_gstin) or (mode == "B2C" and not has_gstin):
+            if inv.get("is_validated") is True:
+                filtered_invoices.append(inv)
+                total_invoice_value += float(inv.get("BILLAMOUNT") or 0.0)
                 
-                for mode, (df, validation_report) in summaries.items():
-                    st.subheader(f"{mode} HSN Summary")
-                    
-                    if df.empty:
-                        st.info(f"No {mode} data available")
-                        continue
-                    
-                    # Display validation results
-                    if validation_report:
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Total Invoices", validation_report.total_invoices)
-                        col2.metric("Invoice Total", f"₹{validation_report.total_invoice_value:,.2f}")
-                        col3.metric("HSN Total", f"₹{validation_report.total_hsn_value:,.2f}")
-                        col4.metric("Difference", f"₹{validation_report.difference:,.2f}")
-                        
-                        # Show validation status
-                        if validation_report.is_valid:
-                            st.success(f"✅ Validation PASSED: HSN totals match invoice totals")
-                        else:
-                            st.error(f"❌ Validation FAILED: HSN totals do not match invoice totals (difference: ₹{validation_report.difference:,.2f})")
-                        
-                        # Show details of mismatched invoices
-                        if validation_report.mismatched_invoices:
-                            with st.expander(f"⚠️ Mismatched invoices ({len(validation_report.mismatched_invoices)})"):
-                                st.dataframe(
-                                    pd.DataFrame(validation_report.mismatched_invoices),
-                                    use_container_width=True,
-                                    hide_index=True
-                                )
-                        
-                        if validation_report.missing_hsn_invoices:
-                            with st.expander(f"⚠️ Invoices without HSN codes ({len(validation_report.missing_hsn_invoices)})"):
-                                st.dataframe(
-                                    pd.DataFrame(validation_report.missing_hsn_invoices),
-                                    use_container_width=True,
-                                    hide_index=True
-                                )
-                    
-                    # Display metrics
-                    total_value = df["Total Value"].sum()
-                    total_taxable = df["Taxable Value"].sum()
-                    total_tax = df["Integrated Tax Amount"].sum() + df["Central Tax Amount"].sum() + df["State/UT Tax Amount"].sum()
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric(f"{mode} - Total Value", f"₹{total_value:,.2f}")
-                    c2.metric(f"{mode} - Taxable Value", f"₹{total_taxable:,.2f}")
-                    c3.metric(f"{mode} - Total Tax", f"₹{total_tax:,.2f}")
-                    
-                    # Show the table
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    
-                    # Download buttons
-                    col1, col2 = st.columns(2)
-                    
-                    csv = df.to_csv(index=False)
-                    col1.download_button(
-                        f"Download {mode} HSN Summary (.csv)",
-                        data=csv,
-                        file_name=f"hsn_{mode.lower()}.csv",
-                        mime="text/csv",
-                        key=f"dl_hsn_{mode}",
+                # Calculate taxable and tax from tax_breakup
+                tax_breakup = inv.get("tax_breakup", [])
+                for bucket in tax_breakup:
+                    total_invoice_taxable += float(bucket.get("TAXABLEVALUE") or 0.0)
+                    total_invoice_tax += (
+                        float(bucket.get("CGSTAMOUNT") or 0.0) +
+                        float(bucket.get("SGSTAMOUNT") or 0.0) +
+                        float(bucket.get("IGSTAMOUNT") or 0.0) +
+                        float(bucket.get("CESSAMOUNT") or 0.0)
                     )
-                    
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        df.to_excel(writer, sheet_name=f"HSN_{mode}", index=False)
-                    col2.download_button(
-                        f"Download {mode} HSN Summary (.xlsx)",
-                        data=buf.getvalue(),
-                        file_name=f"hsn_{mode.lower()}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_hsn_excel_{mode}",
-                    )
-        else:
-            st.info(f"HSN summary generation is currently only implemented for Sales vouchers. Voucher type: {voucher_type}")
+    
+    # Aggregate by HSN code
+    hsn_data = defaultdict(lambda: {
+        "Description": "",
+        "UQC": "OTH-OTHERS",
+        "Total_Quantity": 0.0,
+        "Total_Value": 0.0,
+        "Taxable_Value": 0.0,
+        "IGST_Amount": 0.0,
+        "CGST_Amount": 0.0,
+        "SGST_Amount": 0.0,
+        "Cess_Amount": 0.0,
+        "Rate": 0.0,
+        "Rates": set(),
+        "Invoice_Numbers": set(),
+    })
+    
+    # For validation
+    mismatched_invoices = []
+    missing_hsn_invoices = []
+    
+    for inv in filtered_invoices:
+        invoice_no = inv.get("VOUCHERNUMBER")
+        lines = inv.get("lines", [])
+        
+        if not lines:
+            missing_hsn_invoices.append({
+                "VOUCHERNUMBER": invoice_no,
+                "PARTYNAME": inv.get("PARTYNAME"),
+                "BILLAMOUNT": inv.get("BILLAMOUNT"),
+                "issue": "No line items found"
+            })
+            continue
+        
+        # Track if this invoice has any HSN codes
+        has_hsn = False
+        invoice_total_value = 0.0
+        invoice_taxable_value = 0.0
+        invoice_cgst = 0.0
+        invoice_sgst = 0.0
+        invoice_igst = 0.0
+        invoice_cess = 0.0
+        
+        for line in lines:
+            hsn = line.get("HSNCODE")
+            if not hsn:
+                continue
+            
+            has_hsn = True
+            
+            # Get line amounts
+            amount = float(line.get("AMOUNT") or 0.0)
+            taxable_value = float(line.get("TAXABLEVALUE") or 0.0)
+            gst_amount = float(line.get("GSTAMOUNT") or 0.0)
+            quantity = float(line.get("ACTUALQTY") or 0.0)
+            rate = float(line.get("GSTRATE") or 0.0)
+            
+            invoice_total_value += amount
+            invoice_taxable_value += taxable_value
+            
+            # Find the corresponding tax bucket for this HSN/rate
+            tax_breakup = inv.get("tax_breakup", [])
+            
+            cgst_amount = 0.0
+            sgst_amount = 0.0
+            igst_amount = 0.0
+            cess_amount = 0.0
+            
+            # Find the matching tax bucket
+            for bucket in tax_breakup:
+                if bucket.get("GSTRATE") == rate:
+                    bucket_taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
+                    if bucket_taxable > 0:
+                        proportion = taxable_value / bucket_taxable if bucket_taxable > 0 else 0
+                        cgst_amount = float(bucket.get("CGSTAMOUNT") or 0.0) * proportion
+                        sgst_amount = float(bucket.get("SGSTAMOUNT") or 0.0) * proportion
+                        igst_amount = float(bucket.get("IGSTAMOUNT") or 0.0) * proportion
+                        cess_amount = float(bucket.get("CESSAMOUNT") or 0.0) * proportion
+                    break
+            
+            # If no tax breakup found, use line-level GST amount
+            if cgst_amount == 0 and sgst_amount == 0 and igst_amount == 0:
+                has_igst = any(b.get("IGSTAMOUNT", 0) > 0 for b in tax_breakup)
+                if has_igst:
+                    igst_amount = gst_amount
+                else:
+                    cgst_amount = gst_amount / 2
+                    sgst_amount = gst_amount / 2
+            
+            invoice_cgst += cgst_amount
+            invoice_sgst += sgst_amount
+            invoice_igst += igst_amount
+            invoice_cess += cess_amount
+            
+            # Aggregate
+            data = hsn_data[hsn]
+            data["Description"] = line.get("STOCKITEMNAME", "") or data["Description"]
+            data["Total_Quantity"] += quantity
+            data["Total_Value"] += amount
+            data["Taxable_Value"] += taxable_value
+            data["IGST_Amount"] += igst_amount
+            data["CGST_Amount"] += cgst_amount
+            data["SGST_Amount"] += sgst_amount
+            data["Cess_Amount"] += cess_amount
+            data["Rates"].add(rate)
+            data["Invoice_Numbers"].add(invoice_no)
+        
+        # Validate this invoice's totals against HSN aggregation
+        if has_hsn and validate:
+            hsn_invoice_total = sum(
+                hsn_data[hsn]["Total_Value"] 
+                for hsn in hsn_data 
+                if invoice_no in hsn_data[hsn]["Invoice_Numbers"]
+            )
+            
+            if abs(invoice_total_value - hsn_invoice_total) > 0.01:
+                mismatched_invoices.append({
+                    "VOUCHERNUMBER": invoice_no,
+                    "PARTYNAME": inv.get("PARTYNAME"),
+                    "INVOICE_TOTAL": round(invoice_total_value, 2),
+                    "HSN_AGGREGATED": round(hsn_invoice_total, 2),
+                    "DIFFERENCE": round(invoice_total_value - hsn_invoice_total, 2),
+                })
+        
+        if not has_hsn:
+            missing_hsn_invoices.append({
+                "VOUCHERNUMBER": invoice_no,
+                "PARTYNAME": inv.get("PARTYNAME"),
+                "BILLAMOUNT": inv.get("BILLAMOUNT"),
+                "issue": "No HSN codes found in line items"
+            })
+    
+    # Build DataFrame
+    rows = []
+    total_hsn_value = 0.0
+    total_hsn_taxable = 0.0
+    total_hsn_tax = 0.0
+    
+    for hsn, data in hsn_data.items():
+        rates = data["Rates"]
+        rate = max(rates) if rates else 0
+        
+        rows.append({
+            "HSN": hsn,
+            "Description": data["Description"][:50] if data["Description"] else "",
+            "UQC": data["UQC"],
+            "Total Quantity": round(data["Total_Quantity"], 2),
+            "Total Value": round(data["Total_Value"], 2),
+            "Taxable Value": round(data["Taxable_Value"], 2),
+            "Integrated Tax Amount": round(data["IGST_Amount"], 2),
+            "Central Tax Amount": round(data["CGST_Amount"], 2),
+            "State/UT Tax Amount": round(data["SGST_Amount"], 2),
+            "Cess Amount": round(data["Cess_Amount"], 2),
+            "Rate": rate,
+        })
+        
+        total_hsn_value += data["Total_Value"]
+        total_hsn_taxable += data["Taxable_Value"]
+        total_hsn_tax += data["IGST_Amount"] + data["CGST_Amount"] + data["SGST_Amount"] + data["Cess_Amount"]
+    
+    # Sort by HSN
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("HSN").reset_index(drop=True)
+    
+    # Create validation report
+    validation_report = None
+    if validate:
+        validation_report = HSNValidationReport(
+            mode=mode,
+            total_invoices=len(filtered_invoices),
+            total_invoice_value=total_invoice_value,
+            total_hsn_value=total_hsn_value,
+            total_taxable_value=total_hsn_taxable,
+            total_tax_amount=total_hsn_tax,
+            difference=total_invoice_value - total_hsn_value,
+            is_valid=abs(total_invoice_value - total_hsn_value) < 0.01,
+            mismatched_invoices=mismatched_invoices,
+            missing_hsn_invoices=missing_hsn_invoices
+        )
+    
+    return df, validation_report
+
+
+def generate_hsn_summary_b2b(
+    invoices: List[Dict], 
+    voucher_type: str = "Sales",
+    validate: bool = True
+) -> Tuple[pd.DataFrame, Optional[HSNValidationReport]]:
+    """Generate B2B HSN summary with validation."""
+    return generate_hsn_summary(invoices, mode="B2B", voucher_type=voucher_type, validate=validate)
+
+
+def generate_hsn_summary_b2c(
+    invoices: List[Dict], 
+    voucher_type: str = "Sales",
+    validate: bool = True
+) -> Tuple[pd.DataFrame, Optional[HSNValidationReport]]:
+    """Generate B2C HSN summary with validation."""
+    return generate_hsn_summary(invoices, mode="B2C", voucher_type=voucher_type, validate=validate)
+
+
+def generate_all_hsn_summaries(
+    invoices: List[Dict], 
+    voucher_type: str = "Sales",
+    validate: bool = True
+) -> Dict[str, Tuple[pd.DataFrame, Optional[HSNValidationReport]]]:
+    """Generate both B2B and B2C HSN summaries with validation."""
+    return {
+        "B2B": generate_hsn_summary_b2b(invoices, voucher_type, validate),
+        "B2C": generate_hsn_summary_b2c(invoices, voucher_type, validate),
+    }
