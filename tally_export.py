@@ -21,11 +21,12 @@ class TallyExportConfig:
 
 # Output column layout — matches the sample files exactly
 COMMON_COLUMNS = [
-    "Voucher Date", "Voucher Type Name", "Voucher Number",
+    "Voucher Date", "Reference No.", "Voucher Type Name", "Voucher Number",
     "Buyer/Supplier - Address", "Buyer/Supplier - Pincode",
-    "Ledger Name", "Ledger Amount", "Ledger Amount Dr/Cr",
-    "Item Name", "Billed Quantity", "Item Rate", "Item Rate per", "Item Amount",
-    "Change Mode ", "Buyer/Supplier - Bill to/from",
+    "Ledger Name", "IGST Rate", "CGST Rate", "SGST/UTGST Rate",
+    "Ledger Amount", "Ledger Amount Dr/Cr",
+    "Item Name", "Billed Quantity", "Item Rate", "Item Rate per",
+    "Voucher Narration", "Change Mode",
 ]
 B2B_IDENTITY_COLUMN = "Buyer/Supplier - GSTIN/UIN"
 B2C_IDENTITY_COLUMN = "Buyer/Supplier - GST Registration Type"
@@ -82,25 +83,84 @@ def split_b2b_b2c(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return b2b, b2c
 
 
-def _base_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
-    """Base row with common fields for all voucher types."""
+def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
+    """Get CGST, SGST, IGST rates for a given GSTRATE."""
+    for bucket in tax_breakup:
+        if bucket.get("GSTRATE") == rate:
+            return {
+                "cgst_rate": float(bucket.get("CGST_RATE") or 0),
+                "sgst_rate": float(bucket.get("SGST_RATE") or 0),
+                "igst_rate": float(bucket.get("IGST_RATE") or 0),
+            }
+    return {"cgst_rate": 0, "sgst_rate": 0, "igst_rate": 0}
+
+
+def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
+    """Base row with common fields for sales vouchers."""
     _, state_name = split_state(invoice.get("STATECODE"))
     
     row = {
         "Voucher Date": invoice.get("DATE"),
+        "Reference No.": None,
         "Voucher Type Name": invoice.get("VOUCHERTYPE") or "Sales",
         "Voucher Number": invoice.get("VOUCHERNUMBER"),
         "Buyer/Supplier - Address": None,
         "Buyer/Supplier - Pincode": None,
         "Ledger Name": None,
+        "IGST Rate": None,
+        "CGST Rate": None,
+        "SGST/UTGST Rate": None,
         "Ledger Amount": None,
         "Ledger Amount Dr/Cr": None,
         "Item Name": None,
         "Billed Quantity": None,
         "Item Rate": None,
         "Item Rate per": None,
-        "Item Amount": None,
-        "Change Mode ": "Accounting Invoice",
+        "Voucher Narration": None,
+        "Change Mode": "Accounting Invoice",
+        "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
+        "Buyer/Supplier - Country": config.country,
+        "Buyer/Supplier - State": state_name,
+        "Buyer/Supplier - Place of Supply": state_name,
+    }
+    
+    if mode == "B2B":
+        row[B2B_IDENTITY_COLUMN] = invoice.get("PARTYGSTIN")
+    else:
+        row[B2C_IDENTITY_COLUMN] = "Unregistered/Consumer"
+    
+    return row
+
+
+def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
+    """Base row with common fields for purchase vouchers."""
+    _, state_name = split_state(invoice.get("STATECODE"))
+    
+    # For purchases, Reference No. and Voucher Number should be the same
+    # Using REFERENCENUMBER from the invoice if available, otherwise VOUCHERNUMBER
+    ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
+    voucher_no = invoice.get("VOUCHERNUMBER")
+    voucher_date = invoice.get("REFERENCEDATE") or invoice.get("DATE")
+    
+    row = {
+        "Voucher Date": voucher_date,
+        "Reference No.": ref_no,
+        "Voucher Type Name": invoice.get("VOUCHERTYPE") or "Purchase",
+        "Voucher Number": voucher_no,
+        "Buyer/Supplier - Address": None,
+        "Buyer/Supplier - Pincode": None,
+        "Ledger Name": None,
+        "IGST Rate": None,
+        "CGST Rate": None,
+        "SGST/UTGST Rate": None,
+        "Ledger Amount": None,
+        "Ledger Amount Dr/Cr": None,
+        "Item Name": None,
+        "Billed Quantity": None,
+        "Item Rate": None,
+        "Item Rate per": None,
+        "Voucher Narration": None,
+        "Change Mode": "Accounting Invoice",
         "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
         "Buyer/Supplier - Country": config.country,
         "Buyer/Supplier - State": state_name,
@@ -160,7 +220,7 @@ def build_sales_voucher_rows(
         report.skipped_no_tax_breakup.append(voucher_no)
         return []
     
-    base = _base_row(invoice, mode, config)
+    base = _base_sales_row(invoice, mode, config)
     rows = []
     
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
@@ -296,10 +356,10 @@ def generate_tally_sales_export(
 # ---------------------------------------------------------------------------
 
 PURCHASE_LEDGER_OVERRIDES = {
-    5: "Local Purchase GST 5%",   # matching sales convention
-    18: "Local Purchase GST 18%",
+    5: "GST PURCHASE@5%",   # matching the sample exactly
+    18: "GST PURCHASE@18%",
 }
-ZERO_RATE_PURCHASE_LEDGER = "Local Purchase GST 0%"
+ZERO_RATE_PURCHASE_LEDGER = "GST PURCHASE@0%"
 
 
 def purchase_ledger_name(rate: float, interstate: bool) -> str:
@@ -307,8 +367,8 @@ def purchase_ledger_name(rate: float, interstate: bool) -> str:
     if rate == 0:
         return ZERO_RATE_PURCHASE_LEDGER
     if interstate:
-        return f"Purchase IGST @{fmt_rate(rate)}%"
-    return PURCHASE_LEDGER_OVERRIDES.get(rate, f"Local Purchase GST {fmt_rate(rate)}%")
+        return f"PURCHASE IGST @{fmt_rate(rate)}%"
+    return PURCHASE_LEDGER_OVERRIDES.get(rate, f"GST PURCHASE@{fmt_rate(rate)}%")
 
 
 def input_tax_ledger_name(component: str, rate: float) -> str:
@@ -326,9 +386,12 @@ def build_purchase_voucher_rows(
     report: TallyExportReport
 ) -> List[Dict]:
     """
-    Build Tally rows for a purchase invoice. 
+    Build Tally rows for a purchase invoice matching the sample format.
+    
     Dr: Purchase ledger + Input tax ledgers (B2B) or Purchase GST 0% (B2C)
     Cr: Supplier ledger (full amount)
+    
+    Note: Uses Reference No. and Reference Date from the invoice.
     """
     voucher_no = invoice.get("VOUCHERNUMBER")
     
@@ -341,11 +404,15 @@ def build_purchase_voucher_rows(
         report.skipped_no_tax_breakup.append(voucher_no)
         return []
     
-    base = _base_row(invoice, mode, config)
+    base = _base_purchase_row(invoice, mode, config)
     rows = []
     
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
     party_name = invoice.get("PARTYNAME")
+    
+    # Get reference number and reference date for the voucher
+    ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
+    ref_date = invoice.get("REFERENCEDATE") or invoice.get("DATE")
     
     # 1. Cr: Supplier ledger (full bill amount)
     cr_row = dict(base)
@@ -384,10 +451,16 @@ def build_purchase_voucher_rows(
                     "issue": "both IGST and CGST/SGST populated on the same rate bucket",
                 })
             
+            # Get tax rates for the rate columns
+            tax_rates = get_tax_rates(tax_breakup, rate)
+            
             # Purchase ledger (Dr)
             if taxable > 0:
                 r = dict(base)
                 r["Ledger Name"] = purchase_ledger_name(rate, interstate)
+                r["IGST Rate"] = tax_rates.get("igst_rate", 0)
+                r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
+                r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
                 r["Ledger Amount"] = round(taxable, 2)
                 r["Ledger Amount Dr/Cr"] = "Dr"
                 rows.append(r)
@@ -398,6 +471,7 @@ def build_purchase_voucher_rows(
                 if igst:
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name("IGST", rate)
+                    r["IGST Rate"] = tax_rates.get("igst_rate", 0)
                     r["Ledger Amount"] = round(igst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
                     rows.append(r)
@@ -406,6 +480,7 @@ def build_purchase_voucher_rows(
                 if cgst:
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name("CGST", rate)
+                    r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
                     r["Ledger Amount"] = round(cgst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
                     rows.append(r)
@@ -414,6 +489,7 @@ def build_purchase_voucher_rows(
                     component = "UTGST" if config.home_state_is_ut else "SGST"
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name(component, rate)
+                    r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
                     r["Ledger Amount"] = round(sgst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
                     rows.append(r)
