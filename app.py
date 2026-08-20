@@ -205,6 +205,15 @@ if layout_choice == "two_sheet_joined":
 
     run = st.button("Run", type="primary", disabled=uploaded is None)
 
+    # IMPORTANT: `run` is only True on the exact script-run where the "Run"
+    # button was clicked. Any OTHER button on this page (e.g. "Prepare Tally
+    # Sales vouchers" below) triggers its own full Streamlit rerun, on which
+    # `run` is back to False — so parsing must happen once here and its
+    # result must be stashed in st.session_state, and everything downstream
+    # (Layer A, Result, Tally export) must render FROM session_state rather
+    # than being nested inside `if run:`. Otherwise a click on a later
+    # button makes this whole section disappear, which is exactly the "blank
+    # page" bug this replaces.
     if run and uploaded is not None:
         try:
             item_mapping = json.loads(item_text)
@@ -217,6 +226,25 @@ if layout_choice == "two_sheet_joined":
         item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
         summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
         res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
+        voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
+
+        st.session_state["ts_res"] = res
+        st.session_state["ts_item_df"] = item_df
+        st.session_state["ts_summary_df"] = summary_df
+        st.session_state["ts_item_mapping"] = item_mapping
+        st.session_state["ts_summary_mapping"] = summary_mapping
+        st.session_state["ts_transform"] = transform
+        st.session_state["ts_voucher_type"] = voucher_type
+        st.session_state.pop("tally_export_results", None)  # stale export from a previous Run
+
+    # Render from session_state so this survives reruns triggered by other
+    # buttons on the page (Tally export, download buttons, etc).
+    if st.session_state.get("ts_res") is not None:
+        res = st.session_state["ts_res"]
+        item_mapping = st.session_state["ts_item_mapping"]
+        summary_mapping = st.session_state["ts_summary_mapping"]
+        transform = st.session_state["ts_transform"]
+        voucher_type = st.session_state["ts_voucher_type"]
 
         st.header("3. Layer A")
         if not res.layer_a_ok:
@@ -251,8 +279,9 @@ if layout_choice == "two_sheet_joined":
         if report.join_match_rate < 0.9:
             st.error("Join match rate below 90% — check the transform JSON.")
             with st.expander("Debug: sample keys from both sides", expanded=True):
-                vouchers = None  # already consumed inside run_two_sheet_joined; recompute for display
                 from generic_parser import parse_item_details, parse_summary
+                item_df = st.session_state["ts_item_df"]
+                summary_df = st.session_state["ts_summary_df"]
                 vouchers = parse_item_details(item_df, item_mapping)
                 summary_rows = parse_summary(summary_df, summary_mapping)
                 summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
@@ -268,14 +297,13 @@ if layout_choice == "two_sheet_joined":
 
         st.header("4. Result")
         json_str = json.dumps(res.invoices, indent=2, default=str)
-        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json")
+        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="dl_json")
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
 
         # -------------------------------------------------------------
         # 5. Tally voucher export (Sales only, for now)
         # -------------------------------------------------------------
-        voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
         st.header("5. Tally voucher export")
         if voucher_type != "Sales":
             st.caption(
@@ -294,16 +322,18 @@ if layout_choice == "two_sheet_joined":
                     for a in LEDGER_NAME_ASSUMPTIONS:
                         st.write(f"- {a}")
 
-            export_clicked = st.button("Prepare Tally Sales vouchers", type="primary")
+            export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key="prep_tally_btn")
             if export_clicked:
                 config = TallyExportConfig(
                     home_state_is_ut=home_state_is_ut,
                     round_off_ledger_name=round_off_ledger_name,
                 )
-                results = generate_tally_sales_export(res.invoices, config)
+                st.session_state["tally_export_results"] = generate_tally_sales_export(res.invoices, config)
 
+            tally_results = st.session_state.get("tally_export_results")
+            if tally_results is not None:
                 for mode in ("B2B", "B2C"):
-                    df_out, rpt = results[mode]
+                    df_out, rpt = tally_results[mode]
                     st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
 
                     c1, c2, c3, c4 = st.columns(4)
