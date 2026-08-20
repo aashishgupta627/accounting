@@ -1,30 +1,6 @@
 """
 Orchestrator: dispatches a mapping + its file to the right parser, based on
-mapping["layout_type"]. This is the "which tool do we call" decision the
-Prompt 0 classification call is meant to answer (see notes at bottom) — but
-the set of tools itself is small and fixed, written once per family, not
-once per vendor. A new vendor with an already-known layout_type needs a new
-SCHEMA (from Prompt A/B/C), never new code here.
-
-Currently supported layout_type values:
-
-  "two_sheet_joined"          Summary sheet + Item Details sheet, joined by
-                               a voucher-number key (Purchase/Sales files).
-  "single_sheet_grouped_blocks"
-                               One sheet, block-header rows (e.g. Account +
-                               GST No. stated once) followed by several
-                               detail/line rows with those fields blank,
-                               needing forward-fill (GST Summary file).
-  "single_sheet_flat"         One sheet, one row = one line item, with
-                               voucher-level fields repeated on every row.
-                               No sample file seen yet — parser stubbed
-                               below per the same pattern, untested against
-                               a real export.
-
-Adding a genuinely new family (not just a new vendor) means writing one
-new parse_<family>() function here and one new validate_<family>_mapping()
-in validate_schema.py — everything else (Layer A/B, the Streamlit harness,
-the prompt-generation helpers) stays as-is.
+mapping["layout_type"].
 """
 import pandas as pd
 from dataclasses import dataclass, field
@@ -46,7 +22,7 @@ class RunResult:
     invoices: list
     layer_a_ok: bool
     layer_a_failures: list = field(default_factory=list)
-    report: object = None  # LayerBReport or GroupedBlocksReport, family-specific
+    report: object = None
 
 
 def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapping, transform):
@@ -81,11 +57,6 @@ def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mappin
 
 
 def parse_single_sheet_flat(df_raw: pd.DataFrame, mapping: dict) -> list:
-    """UNTESTED against a real file — written to the same shape as the
-    other two parsers so it's ready the moment a matching sample shows up.
-    One row = one line item; voucher-level fields (VOUCHERNUMBER, DATE,
-    PARTYNAME, ...) repeat on every row belonging to that voucher, so
-    grouping is just 'consecutive rows with the same VOUCHERNUMBER'."""
     voucher_fields_map = mapping["voucher_fields_column_map"]
     item_map = mapping["item_row_column_map"]
     extra_fields = mapping.get("extra_fields", {})
