@@ -26,6 +26,51 @@ st.caption(
     "(exactly what an LLM detection call would return) until that call is wired in."
 )
 
+
+# ---------------------------------------------------------------------------
+# Helper function for displaying export results (defined BEFORE use)
+# ---------------------------------------------------------------------------
+
+def _display_export_results(result: tuple, mode: str, voucher_type: str):
+    """Display Tally export results for a single mode (B2B or B2C)."""
+    df_out, rpt = result
+    
+    st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Invoices in", rpt.total_invoices_in)
+    c2.metric("Skipped (not validated)", len(rpt.skipped_not_validated))
+    c3.metric("Skipped (no tax breakup)", len(rpt.skipped_no_tax_breakup))
+    c4.metric("Balance mismatches", len(rpt.balance_mismatches))
+    
+    if rpt.balance_mismatches:
+        st.error("Some vouchers do not balance Dr = Cr — review before importing to Tally.")
+        st.dataframe(pd.DataFrame(rpt.balance_mismatches), use_container_width=True, hide_index=True)
+    
+    if rpt.gstin_state_mismatches:
+        with st.expander(f"{mode}: data-quality flags ({len(rpt.gstin_state_mismatches)})"):
+            st.dataframe(pd.DataFrame(rpt.gstin_state_mismatches), use_container_width=True, hide_index=True)
+    
+    if rpt.skipped_not_validated:
+        with st.expander(f"{mode}: skipped — is_validated != True ({len(rpt.skipped_not_validated)})"):
+            st.write(rpt.skipped_not_validated)
+    
+    if not df_out.empty:
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
+        st.download_button(
+            f"Download {mode} Tally {voucher_type} vouchers (.xlsx)",
+            data=buf.getvalue(),
+            file_name=f"Tally{voucher_type}Vouchers_{mode}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_{voucher_type}_{mode}",
+        )
+    else:
+        st.info(f"No {mode} {voucher_type} vouchers to export.")
+
+
 # ---------------------------------------------------------------------------
 # Example mappings for the three real files already validated end-to-end.
 # ---------------------------------------------------------------------------
@@ -440,47 +485,3 @@ else:
         invoices = parse_single_sheet_flat(df_raw, flat_mapping)
         st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
         st.json(invoices[:5])
-
-
-# ---------------------------------------------------------------------------
-# Helper function for displaying export results
-# ---------------------------------------------------------------------------
-
-def _display_export_results(result: tuple, mode: str, voucher_type: str):
-    """Display Tally export results for a single mode (B2B or B2C)."""
-    df_out, rpt = result
-    
-    st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
-    
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Invoices in", rpt.total_invoices_in)
-    c2.metric("Skipped (not validated)", len(rpt.skipped_not_validated))
-    c3.metric("Skipped (no tax breakup)", len(rpt.skipped_no_tax_breakup))
-    c4.metric("Balance mismatches", len(rpt.balance_mismatches))
-    
-    if rpt.balance_mismatches:
-        st.error("Some vouchers do not balance Dr = Cr — review before importing to Tally.")
-        st.dataframe(pd.DataFrame(rpt.balance_mismatches), use_container_width=True, hide_index=True)
-    
-    if rpt.gstin_state_mismatches:
-        with st.expander(f"{mode}: data-quality flags ({len(rpt.gstin_state_mismatches)})"):
-            st.dataframe(pd.DataFrame(rpt.gstin_state_mismatches), use_container_width=True, hide_index=True)
-    
-    if rpt.skipped_not_validated:
-        with st.expander(f"{mode}: skipped — is_validated != True ({len(rpt.skipped_not_validated)})"):
-            st.write(rpt.skipped_not_validated)
-    
-    if not df_out.empty:
-        st.dataframe(df_out, use_container_width=True, hide_index=True)
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
-        st.download_button(
-            f"Download {mode} Tally {voucher_type} vouchers (.xlsx)",
-            data=buf.getvalue(),
-            file_name=f"Tally{voucher_type}Vouchers_{mode}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl_{voucher_type}_{mode}",
-        )
-    else:
-        st.info(f"No {mode} {voucher_type} vouchers to export.")
