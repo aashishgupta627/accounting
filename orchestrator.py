@@ -26,6 +26,7 @@ class RunResult:
 
 
 def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapping, transform):
+    """Run the two-sheet-joined layout parser with validation."""
     item_sample = item_df_raw.iloc[:25]
     summary_sample = summary_df_raw.iloc[:15]
     ok_item, r_item = validate_and_decide(item_mapping, item_sample)
@@ -43,6 +44,7 @@ def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapp
 
 
 def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mapping, header_row=None):
+    """Run the single-sheet-grouped-blocks layout parser with validation."""
     norm = normalize_sheet(sheet_df_raw)
     data_region = norm.iloc[header_row + 1:].reset_index(drop=True) if header_row is not None else norm
     filled = forward_fill_blocks(data_region, ingest_mapping)
@@ -57,6 +59,21 @@ def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mappin
 
 
 def parse_single_sheet_flat(df_raw: pd.DataFrame, mapping: dict) -> list:
+    """
+    Parse a single-sheet-flat layout (one row per line item).
+    
+    This layout type is UNTESTED and provided for future compatibility.
+    The parser follows the same pattern as the other two layouts but hasn't
+    been validated against a real export.
+    
+    The mapping should contain:
+    - voucher_fields_column_map: {field_name: column_index} for voucher-level fields
+      (VOUCHERNUMBER, VOUCHERDATE, PARTYNAME, PARTYGSTIN, PARTYSTATECODE, etc.)
+    - item_row_column_map: {field_name: column_index} for item-level fields
+    - extra_fields: {field_name: column_index} for vendor-specific fields (optional)
+    - line_identifier_field: field name that identifies a line (default: STOCKITEMNAME)
+    - data_start_row: 0-based row index where data begins
+    """
     voucher_fields_map = mapping["voucher_fields_column_map"]
     item_map = mapping["item_row_column_map"]
     extra_fields = mapping.get("extra_fields", {})
@@ -99,3 +116,33 @@ def parse_single_sheet_flat(df_raw: pd.DataFrame, mapping: dict) -> list:
         invoices[voucher_no]["lines"].append(line)
 
     return [invoices[k] for k in order]
+
+
+def run_single_sheet_flat(df_raw: pd.DataFrame, mapping: dict) -> RunResult:
+    """
+    Run the single-sheet-flat layout parser with validation.
+    
+    This is a wrapper around parse_single_sheet_flat that provides the same
+    interface as the other layout runners (validation + RunResult).
+    """
+    # Validate the mapping structure
+    sample_df = df_raw.iloc[:25]
+    ok, r = validate_and_decide(mapping, sample_df)
+    if not ok:
+        return RunResult("single_sheet_flat", [], False, r.failures)
+    
+    # Parse the data
+    invoices = parse_single_sheet_flat(df_raw, mapping)
+    
+    # Note: reconciliation is not implemented for flat layout yet
+    # Create a minimal report for consistency
+    class FlatReport:
+        def __init__(self, total_invoices):
+            self.total_invoices = total_invoices
+            self.reconciled_invoices = 0
+            self.mismatched_invoices = 0
+            self.mismatch_detail = []
+    
+    report = FlatReport(len(invoices))
+    
+    return RunResult("single_sheet_flat", invoices, True, [], report)
