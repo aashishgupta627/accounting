@@ -32,8 +32,8 @@ COMMON_COLUMNS = [
 
 # HSN columns that will be added for each ledger entry
 HSN_COLUMNS = [
-    "HSN/SAC Details: Specify Details Here",
-    "HSN/SAC: Provide the HSN Code here",
+    "HSN/SAC Details: Specify Details Here",  # Fixed value "Specify Details Here"
+    "HSN/SAC: Provide the HSN Code here",     # Actual HSN code
 ]
 
 B2B_IDENTITY_COLUMN = "Buyer/Supplier - GSTIN/UIN"
@@ -111,8 +111,8 @@ def classify_purchase_invoice(invoice: Dict) -> str:
     """
     Classify a purchase invoice as B2B or B2C.
     
-    B2B: Has tax (GST rate > 0 with amounts > 0) OR has GSTIN
-    B2C: No GSTIN AND no tax
+    B2B: Has tax (GST rate > 0 with amounts > 0)
+    B2C: No GSTIN AND no tax (all GST rates are 0 or no tax amounts)
     """
     # If there's tax, it's B2B regardless of GSTIN
     if has_tax(invoice):
@@ -158,6 +158,120 @@ def split_b2b_b2c_sales(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         else:
             b2c.append(inv)
     return b2b, b2c
+
+
+def aggregate_by_hsn(invoice: Dict) -> Dict:
+    """
+    Aggregate line items by HSN code within an invoice.
+    
+    Uses the invoice-level tax_breakup to distribute tax amounts by HSN.
+    Returns: {hsn_code: {"taxable": sum, "cgst": sum, "sgst": sum, "igst": sum, "cess": sum, "gstrate": rate}}
+    """
+    # Get the tax breakup from the invoice
+    tax_breakup = invoice.get("tax_breakup") or []
+    
+    # If no tax breakup, return empty
+    if not tax_breakup:
+        return {}
+    
+    # Get items
+    items = invoice.get("items") or invoice.get("lines") or []
+    
+    # Group items by HSN and calculate total taxable value per HSN
+    hsn_taxable = defaultdict(float)
+    hsn_gstrate = defaultdict(float)
+    hsn_items = defaultdict(list)
+    
+    for item in items:
+        hsn = item.get("HSNCODE")
+        if not hsn:
+            continue
+        
+        taxable = float(item.get("TAXABLEVALUE") or 0.0)
+        gstrate = float(item.get("GSTRATE") or 0.0)
+        
+        hsn_taxable[hsn] += taxable
+        if gstrate > 0:
+            hsn_gstrate[hsn] = gstrate
+        hsn_items[hsn].append(item)
+    
+    # If no HSNs found, use a single default HSN
+    if not hsn_taxable:
+        # Use a default HSN code
+        hsn_taxable["DEFAULT"] = float(invoice.get("BILLAMOUNT") or 0.0)
+        hsn_gstrate["DEFAULT"] = tax_breakup[0].get("GSTRATE", 0) if tax_breakup else 0
+        hsn_items["DEFAULT"] = items
+    
+    # Now distribute the tax from tax_breakup across HSNs based on taxable value
+    hsn_aggregates = {}
+    
+    # Calculate total taxable across all HSNs
+    total_taxable = sum(hsn_taxable.values())
+    
+    if total_taxable == 0:
+        # If no taxable value, distribute equally
+        total_taxable = len(hsn_taxable)
+    
+    for hsn, taxable in hsn_taxable.items():
+        gstrate = hsn_gstrate.get(hsn, 0)
+        
+        # If no rate from items, try to get from tax_breakup
+        if gstrate == 0 and tax_breakup:
+            gstrate = tax_breakup[0].get("GSTRATE", 0)
+        
+        # Find matching tax bucket for this rate
+        cgst = 0.0
+        sgst = 0.0
+        igst = 0.0
+        cess = 0.0
+        
+        for bucket in tax_breakup:
+            bucket_rate = bucket.get("GSTRATE", 0)
+            if bucket_rate == gstrate:
+                # Calculate proportional tax based on this HSN's taxable value
+                bucket_taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
+                if bucket_taxable > 0:
+                    proportion = taxable / bucket_taxable
+                    cgst = float(bucket.get("CGSTAMOUNT") or 0.0) * proportion
+                    sgst = float(bucket.get("SGSTAMOUNT") or 0.0) * proportion
+                    igst = float(bucket.get("IGSTAMOUNT") or 0.0) * proportion
+                    cess = float(bucket.get("CESSAMOUNT") or 0.0) * proportion
+                break
+        
+        # If no matching rate found, use proportional distribution of first bucket
+        if not (cgst or sgst or igst) and tax_breakup:
+            bucket = tax_breakup[0]
+            bucket_taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
+            if bucket_taxable > 0:
+                proportion = taxable / bucket_taxable
+                cgst = float(bucket.get("CGSTAMOUNT") or 0.0) * proportion
+                sgst = float(bucket.get("SGSTAMOUNT") or 0.0) * proportion
+                igst = float(bucket.get("IGSTAMOUNT") or 0.0) * proportion
+                cess = float(bucket.get("CESSAMOUNT") or 0.0) * proportion
+                gstrate = bucket.get("GSTRATE", 0)
+        
+        hsn_aggregates[hsn] = {
+            "taxable": taxable,
+            "cgst": cgst,
+            "sgst": sgst,
+            "igst": igst,
+            "cess": cess,
+            "gstrate": gstrate,
+        }
+    
+    return hsn_aggregates
+
+
+def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
+    """Get CGST, SGST, IGST rates for a given GSTRATE."""
+    for bucket in tax_breakup:
+        if bucket.get("GSTRATE") == rate:
+            return {
+                "cgst_rate": float(bucket.get("CGST_RATE") or 0),
+                "sgst_rate": float(bucket.get("SGST_RATE") or 0),
+                "igst_rate": float(bucket.get("IGST_RATE") or 0),
+            }
+    return {"cgst_rate": 0, "sgst_rate": 0, "igst_rate": 0}
 
 
 def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig, hsn_code: str = None) -> Dict:
@@ -279,11 +393,13 @@ def build_sales_voucher_rows(
         report.skipped_no_tax_breakup.append(voucher_no)
         return []
     
+    hsn_aggregates = aggregate_by_hsn(invoice)
+    
     rows = []
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
     party_name = invoice.get("PARTYNAME")
     
-    # Dr: Party ledger
+    # Dr: Party ledger (no HSN)
     dr_row = _base_sales_row(invoice, mode, config)
     dr_row["Ledger Name"] = party_name
     dr_row["Ledger Amount"] = round(bill_amount, 2)
@@ -292,55 +408,62 @@ def build_sales_voucher_rows(
     
     total_cr = 0.0
     
-    # Cr: Sales + tax ledgers
-    for bucket in tax_breakup:
-        rate = bucket.get("GSTRATE", 0)
-        taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
-        cgst = float(bucket.get("CGSTAMOUNT") or 0.0)
-        sgst = float(bucket.get("SGSTAMOUNT") or 0.0)
-        igst = float(bucket.get("IGSTAMOUNT") or 0.0)
-        cess = float(bucket.get("CESSAMOUNT") or 0.0)
+    # Cr: Sales + tax ledgers (aggregated by HSN)
+    for hsn, hsn_data in hsn_aggregates.items():
+        rate = hsn_data.get("gstrate", 0)
+        taxable = hsn_data["taxable"]
+        cgst = hsn_data["cgst"]
+        sgst = hsn_data["sgst"]
+        igst = hsn_data["igst"]
+        cess = hsn_data["cess"]
         
         interstate = igst > 0
         
+        # Sales ledger (Cr) - aggregated by HSN
         if taxable:
-            r = _base_sales_row(invoice, mode, config)
+            r = _base_sales_row(invoice, mode, config, hsn_code=hsn)
             r["Ledger Name"] = sales_ledger_name(rate, interstate)
             r["Ledger Amount"] = round(taxable, 2)
             r["Ledger Amount Dr/Cr"] = "Cr"
+            r["Item Name"] = f"HSN {hsn}"
             rows.append(r)
             total_cr += taxable
         
+        # Output tax ledgers (Cr)
         if interstate:
             if igst:
-                r = _base_sales_row(invoice, mode, config)
+                r = _base_sales_row(invoice, mode, config, hsn_code=hsn)
                 r["Ledger Name"] = output_tax_ledger_name("IGST", rate)
                 r["Ledger Amount"] = round(igst, 2)
                 r["Ledger Amount Dr/Cr"] = "Cr"
+                r["Item Name"] = f"HSN {hsn}"
                 rows.append(r)
                 total_cr += igst
         else:
             if cgst:
-                r = _base_sales_row(invoice, mode, config)
+                r = _base_sales_row(invoice, mode, config, hsn_code=hsn)
                 r["Ledger Name"] = output_tax_ledger_name("CGST", rate)
                 r["Ledger Amount"] = round(cgst, 2)
                 r["Ledger Amount Dr/Cr"] = "Cr"
+                r["Item Name"] = f"HSN {hsn}"
                 rows.append(r)
                 total_cr += cgst
             if sgst:
                 component = "UTGST" if config.home_state_is_ut else "SGST"
-                r = _base_sales_row(invoice, mode, config)
+                r = _base_sales_row(invoice, mode, config, hsn_code=hsn)
                 r["Ledger Name"] = output_tax_ledger_name(component, rate)
                 r["Ledger Amount"] = round(sgst, 2)
                 r["Ledger Amount Dr/Cr"] = "Cr"
+                r["Item Name"] = f"HSN {hsn}"
                 rows.append(r)
                 total_cr += sgst
         
         if cess:
-            r = _base_sales_row(invoice, mode, config)
+            r = _base_sales_row(invoice, mode, config, hsn_code=hsn)
             r["Ledger Name"] = "Output CESS"
             r["Ledger Amount"] = round(cess, 2)
             r["Ledger Amount Dr/Cr"] = "Cr"
+            r["Item Name"] = f"HSN {hsn}"
             rows.append(r)
             total_cr += cess
     
@@ -444,11 +567,14 @@ def build_purchase_voucher_rows(
         report.skipped_no_tax_breakup.append(voucher_no)
         return []
     
+    # Aggregate by HSN
+    hsn_aggregates = aggregate_by_hsn(invoice)
+    
     rows = []
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
     party_name = invoice.get("PARTYNAME")
     
-    # Cr: Supplier ledger (full bill amount)
+    # Cr: Supplier ledger (no HSN)
     cr_row = _base_purchase_row(invoice, mode, config)
     cr_row["Ledger Name"] = party_name
     cr_row["Ledger Amount"] = round(bill_amount, 2)
@@ -467,64 +593,74 @@ def build_purchase_voucher_rows(
         rows.append(r)
         total_dr += bill_amount
     else:
-        # B2B: Full tax breakdown
-        for bucket in tax_breakup:
-            rate = bucket.get("GSTRATE", 0)
-            taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
-            cgst = float(bucket.get("CGSTAMOUNT") or 0.0)
-            sgst = float(bucket.get("SGSTAMOUNT") or 0.0)
-            igst = float(bucket.get("IGSTAMOUNT") or 0.0)
-            cess = float(bucket.get("CESSAMOUNT") or 0.0)
+        # B2B: Full tax breakdown aggregated by HSN
+        for hsn, hsn_data in hsn_aggregates.items():
+            rate = hsn_data.get("gstrate", 0)
+            taxable = hsn_data["taxable"]
+            cgst = hsn_data["cgst"]
+            sgst = hsn_data["sgst"]
+            igst = hsn_data["igst"]
+            cess = hsn_data["cess"]
             
             interstate = igst > 0
             
-            # Purchase ledger (Dr)
-            if taxable > 0:
-                r = _base_purchase_row(invoice, mode, config)
+            if igst > 0 and (cgst > 0 or sgst > 0):
+                report.gstin_state_mismatches.append({
+                    "VOUCHERNUMBER": voucher_no,
+                    "HSNCODE": hsn,
+                    "GSTRATE": rate,
+                    "issue": "both IGST and CGST/SGST populated on the same HSN",
+                })
+            
+            # Purchase ledger (Dr) - aggregated by HSN
+            if taxable or rate == 0:
+                r = _base_purchase_row(invoice, mode, config, hsn_code=hsn)
                 r["Ledger Name"] = purchase_ledger_name(rate, interstate)
                 r["Ledger Amount"] = round(taxable, 2)
                 r["Ledger Amount Dr/Cr"] = "Dr"
+                r["Item Name"] = f"HSN {hsn}"
                 rows.append(r)
                 total_dr += taxable
             
-            # Input tax ledgers (Dr)
+            # Input tax ledgers (Dr) - only if there's tax
             if interstate:
                 if igst:
-                    r = _base_purchase_row(invoice, mode, config)
+                    r = _base_purchase_row(invoice, mode, config, hsn_code=hsn)
                     r["Ledger Name"] = input_tax_ledger_name("IGST", rate)
                     r["Ledger Amount"] = round(igst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
+                    r["Item Name"] = f"HSN {hsn}"
                     rows.append(r)
                     total_dr += igst
             else:
                 if cgst:
-                    r = _base_purchase_row(invoice, mode, config)
+                    r = _base_purchase_row(invoice, mode, config, hsn_code=hsn)
                     r["Ledger Name"] = input_tax_ledger_name("CGST", rate)
                     r["Ledger Amount"] = round(cgst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
+                    r["Item Name"] = f"HSN {hsn}"
                     rows.append(r)
                     total_dr += cgst
                 if sgst:
                     component = "UTGST" if config.home_state_is_ut else "SGST"
-                    r = _base_purchase_row(invoice, mode, config)
+                    r = _base_purchase_row(invoice, mode, config, hsn_code=hsn)
                     r["Ledger Name"] = input_tax_ledger_name(component, rate)
                     r["Ledger Amount"] = round(sgst, 2)
                     r["Ledger Amount Dr/Cr"] = "Dr"
+                    r["Item Name"] = f"HSN {hsn}"
                     rows.append(r)
                     total_dr += sgst
             
             if cess:
-                r = _base_purchase_row(invoice, mode, config)
+                r = _base_purchase_row(invoice, mode, config, hsn_code=hsn)
                 r["Ledger Name"] = "INPUT CESS"
                 r["Ledger Amount"] = round(cess, 2)
                 r["Ledger Amount Dr/Cr"] = "Dr"
+                r["Item Name"] = f"HSN {hsn}"
                 rows.append(r)
                 total_dr += cess
     
     # Round Off - balancing entry
-    # residual = bill_amount - total_dr
-    # If residual > 0: Dr < Cr, so need Dr Round Off (to increase Dr to match Cr)
-    # If residual < 0: Dr > Cr, so need Cr Round Off (to increase Cr to match Dr)
     residual = bill_amount - total_dr
     
     if abs(residual) > 0.004:
