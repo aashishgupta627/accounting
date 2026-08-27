@@ -14,7 +14,7 @@ from validate_schema import validate_and_decide, apply_transform
 from ingest import normalize_sheet, forward_fill_blocks
 from orchestrator import run_two_sheet_joined, run_single_sheet_grouped_blocks
 from tally_export import (
-    generate_tally_sales_export, 
+    generate_tally_sales_export,
     generate_tally_purchase_export,
     TallyExportConfig,
 )
@@ -35,27 +35,27 @@ st.caption(
 def _display_export_results(result: tuple, mode: str, voucher_type: str):
     """Display Tally export results for a single mode (B2B or B2C)."""
     df_out, rpt = result
-    
+
     st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
-    
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Invoices in", rpt.total_invoices_in)
     c2.metric("Skipped (not validated)", len(rpt.skipped_not_validated))
     c3.metric("Skipped (no tax breakup)", len(rpt.skipped_no_tax_breakup))
     c4.metric("Balance mismatches", len(rpt.balance_mismatches))
-    
+
     if rpt.balance_mismatches:
         st.error("Some vouchers do not balance Dr = Cr — review before importing to Tally.")
         st.dataframe(pd.DataFrame(rpt.balance_mismatches), use_container_width=True, hide_index=True)
-    
+
     if rpt.gstin_state_mismatches:
         with st.expander(f"{mode}: data-quality flags ({len(rpt.gstin_state_mismatches)})"):
             st.dataframe(pd.DataFrame(rpt.gstin_state_mismatches), use_container_width=True, hide_index=True)
-    
+
     if rpt.skipped_not_validated:
         with st.expander(f"{mode}: skipped — is_validated != True ({len(rpt.skipped_not_validated)})"):
             st.write(rpt.skipped_not_validated)
-    
+
     if not df_out.empty:
         st.dataframe(df_out, use_container_width=True, hide_index=True)
         buf = io.BytesIO()
@@ -73,28 +73,45 @@ def _display_export_results(result: tuple, mode: str, voucher_type: str):
 
 
 # ---------------------------------------------------------------------------
-# Example mappings for the three real files already validated end-to-end.
+# Example mappings for the two real files already validated end-to-end
+# against Sales_July.xlsx and Purchase_July.xlsx (317/317 and 1181/1181
+# invoices reconciled, 0 Dr/Cr balance mismatches on either Tally export).
+#
+# SCHEMA NOTE: DATE -> VOUCHERDATE, STATECODE -> PARTYSTATECODE (see
+# validate_schema.py's module docstring). BATCHNAME/EXPIRYDATE/FREEQTY are
+# no longer core item fields — they're captured via extra_fields on both
+# item mappings below, same as MARGIN1/MARGIN2/COST already were.
+#
+# COLUMN-OFFSET FIXES (found by testing against the real files, not just
+# the column-shape samples): Purchase item mapping's DISCOUNT was pointing
+# at "DIS%" (col 13, a percentage) instead of "DIS AMT" (col 14, the real
+# currency amount) — now col 14. MARGIN1/MARGIN2/COST were off by one
+# column (25/26/27, where 25 is actually "CATEGORY") — now 26/27/28. Both
+# mappings' header_row/data_start_row were also pointing above the real
+# 5-row report letterhead in the actual monthly exports — now header_row=5
+# (summary) / header_rows=[4,5], data_start_row=6 (items) for both Sales
+# and Purchase.
 # ---------------------------------------------------------------------------
 
 EXAMPLES = {
     "Purchase (two_sheet_joined)": {
         "layout_type": "two_sheet_joined",
         "item_mapping": {
-            "sheet_type": "item_details", "header_rows": [0, 1], "data_start_row": 3,
+            "sheet_type": "item_details", "header_rows": [4, 5], "data_start_row": 6,
             "invoice_block_marker": {
                 "column": 0, "pattern": r"[A-Z]{2,4}/\d+",
                 "blob_extract": {
-                    "DATE": r"(?P<v>\d{2}-[A-Za-z]{3}-\d{2})",
+                    "VOUCHERDATE": r"(?P<v>\d{2}-[A-Za-z]{3}-\d{2})",
                     "VOUCHERNUMBER": r"(?P<v>[A-Z]{2,4}/\d+)",
                     "PARTYNAME": r"[A-Z]{2,4}/\d+\s+(?P<v>.+?)\s+User",
                 },
             },
             "item_row_column_map": {
-                "STOCKITEMNAME": 2, "BATCHNAME": 5, "EXPIRYDATE": 7, "ACTUALQTY": 8,
-                "FREEQTY": 9, "RATE": 10, "GSTRATE": 19, "AMOUNT": 21, "DISCOUNT": 13,
+                "STOCKITEMNAME": 2, "ACTUALQTY": 8,
+                "RATE": 10, "GSTRATE": 19, "AMOUNT": 21, "DISCOUNT": 14,
                 "GSTAMOUNT": 22, "HSNCODE": 23,
             },
-            "extra_fields": {"MARGIN1": 25, "MARGIN2": 26, "COST": 27},
+            "extra_fields": {"BATCHNAME": 5, "EXPIRYDATE": 7, "FREEQTY": 9, "MARGIN1": 26, "MARGIN2": 27, "COST": 28},
             "skip_row_rules": [
                 {"column": 2, "equals_normalized": "TOTAL:"},
                 {"column": 2, "equals_normalized": "GRAND TOTAL:"},
@@ -103,13 +120,13 @@ EXAMPLES = {
             "voucher_type": "Purchase",
         },
         "summary_mapping": {
-            "sheet_type": "consolidated_summary", "header_row": 0,
+            "sheet_type": "consolidated_summary", "header_row": 5,
             "voucher_type": "Purchase",
             "footer_marker": {"column": 0, "equals_normalized": "Total :"},
             "voucher_number_pattern": r"^[A-Z]{2,4}/\d+$",
             "column_map": {
-                "DATE": 3, "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
-                "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8, "STATECODE": 32,
+                "VOUCHERDATE": 3, "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
+                "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8, "PARTYSTATECODE": 32,
                 "REFERENCENUMBER": 4, "REFERENCEDATE": 0,
             },
             "tax_rate_breakup": [
@@ -129,31 +146,32 @@ EXAMPLES = {
     "Sales (two_sheet_joined)": {
         "layout_type": "two_sheet_joined",
         "item_mapping": {
-            "sheet_type": "item_details", "header_rows": [0, 1], "data_start_row": 2,
+            "sheet_type": "item_details", "header_rows": [4, 5], "data_start_row": 6,
             "invoice_block_marker": {
                 "column": 2, "pattern": r"S0/\d+",
                 "fields": {
-                    "VOUCHERNUMBER": 2, "DATE": 0, "PARTYNAME": 3,
+                    "VOUCHERNUMBER": 2, "VOUCHERDATE": 0, "PARTYNAME": 3,
                     "ROUNDOFFAMOUNT": 15, "BILLAMOUNT": 16,
                 },
             },
             "item_row_column_map": {
-                "STOCKITEMNAME": 1, "BATCHNAME": 3, "EXPIRYDATE": 5, "ACTUALQTY": 8,
-                "FREEQTY": 9, "GSTRATE": 10, "RATE": 11, "AMOUNT": 12, "DISCOUNT": 13,
+                "STOCKITEMNAME": 1, "ACTUALQTY": 8,
+                "GSTRATE": 10, "RATE": 11, "AMOUNT": 12, "DISCOUNT": 13,
                 "TAXABLEVALUE": 14, "NETAMOUNT": 15, "HSNCODE": 17, "GSTAMOUNT": 18,
             },
+            "extra_fields": {"BATCHNAME": 3, "EXPIRYDATE": 5, "FREEQTY": 9},
             "skip_row_rules": [],
             "confidence": 0.92,
             "voucher_type": "Sales",
         },
         "summary_mapping": {
-            "sheet_type": "consolidated_summary", "header_row": 0,
+            "sheet_type": "consolidated_summary", "header_row": 5,
             "voucher_type": "Sales",
             "footer_marker": {"column": 0, "equals_normalized": "Total :"},
             "voucher_number_pattern": r"^S0-\d+-\d+$",
             "column_map": {
-                "DATE": 0, "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
-                "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7, "STATECODE": 32,
+                "VOUCHERDATE": 0, "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
+                "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7, "PARTYSTATECODE": 32,
             },
             "tax_rate_breakup": [
                 {"GSTRATE": 5, "TAXABLEVALUE": 9, "CGSTAMOUNT": 10, "SGSTAMOUNT": 11, "IGSTAMOUNT": 12},
@@ -180,7 +198,7 @@ EXAMPLES = {
             "sheet_type": "single_sheet_grouped_blocks",
             "line_identifier_field": "HSNCODE",
             "column_map": {
-                "PARTYNAME": 0, "PARTYGSTIN": 1, "DATE": 2, "VOUCHERNUMBER": 3, "HSNCODE": 4,
+                "PARTYNAME": 0, "PARTYGSTIN": 1, "VOUCHERDATE": 2, "VOUCHERNUMBER": 3, "HSNCODE": 4,
                 "ACTUALQTY": 5, "AMOUNT": 6, "TAXABLEVALUE": 7, "CGSTAMOUNT": 8,
                 "SGSTAMOUNT": 9, "IGSTAMOUNT": 10, "CESSAMOUNT": 11, "GSTAMOUNT": 12,
             },
@@ -349,22 +367,22 @@ if layout_choice == "two_sheet_joined":
             "Only invoices with is_validated = True are included. "
             "Reports include validation to ensure totals match invoice data."
         )
-        
+
         if voucher_type == "Sales":
             if st.button("Generate HSN Summaries", type="primary", key="gen_hsn_btn"):
                 summaries = generate_all_hsn_summaries(res.invoices, voucher_type, validate=True)
                 st.session_state["hsn_summaries"] = summaries
-            
+
             if st.session_state.get("hsn_summaries") is not None:
                 summaries = st.session_state["hsn_summaries"]
-                
+
                 for mode, (df, validation_report) in summaries.items():
                     st.subheader(f"{mode} HSN Summary")
-                    
+
                     if df.empty:
                         st.info(f"No {mode} data available")
                         continue
-                    
+
                     # Display validation results
                     if validation_report:
                         col1, col2, col3, col4 = st.columns(4)
@@ -372,13 +390,13 @@ if layout_choice == "two_sheet_joined":
                         col2.metric("Invoice Total", f"₹{validation_report.total_invoice_value:,.2f}")
                         col3.metric("HSN Total", f"₹{validation_report.total_hsn_value:,.2f}")
                         col4.metric("Difference", f"₹{validation_report.difference:,.2f}")
-                        
+
                         # Show validation status
                         if validation_report.is_valid:
                             st.success(f"✅ Validation PASSED: HSN totals match invoice totals")
                         else:
                             st.error(f"❌ Validation FAILED: HSN totals do not match invoice totals (difference: ₹{validation_report.difference:,.2f})")
-                        
+
                         # Show details of mismatched invoices
                         if validation_report.mismatched_invoices:
                             with st.expander(f"⚠️ Mismatched invoices ({len(validation_report.mismatched_invoices)})"):
@@ -387,7 +405,7 @@ if layout_choice == "two_sheet_joined":
                                     use_container_width=True,
                                     hide_index=True
                                 )
-                        
+
                         if validation_report.missing_hsn_invoices:
                             with st.expander(f"⚠️ Invoices without HSN codes ({len(validation_report.missing_hsn_invoices)})"):
                                 st.dataframe(
@@ -395,23 +413,23 @@ if layout_choice == "two_sheet_joined":
                                     use_container_width=True,
                                     hide_index=True
                                 )
-                    
+
                     # Display metrics
                     total_value = df["Total Value"].sum()
                     total_taxable = df["Taxable Value"].sum()
                     total_tax = df["Integrated Tax Amount"].sum() + df["Central Tax Amount"].sum() + df["State/UT Tax Amount"].sum()
-                    
+
                     c1, c2, c3 = st.columns(3)
                     c1.metric(f"{mode} - Total Value", f"₹{total_value:,.2f}")
                     c2.metric(f"{mode} - Taxable Value", f"₹{total_taxable:,.2f}")
                     c3.metric(f"{mode} - Total Tax", f"₹{total_tax:,.2f}")
-                    
+
                     # Show the table
                     st.dataframe(df, use_container_width=True, hide_index=True)
-                    
+
                     # Download buttons
                     col1, col2 = st.columns(2)
-                    
+
                     csv = df.to_csv(index=False)
                     col1.download_button(
                         f"Download {mode} HSN Summary (.csv)",
@@ -420,7 +438,7 @@ if layout_choice == "two_sheet_joined":
                         mime="text/csv",
                         key=f"dl_hsn_{mode}",
                     )
-                    
+
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                         df.to_excel(writer, sheet_name=f"HSN_{mode}", index=False)
@@ -438,12 +456,12 @@ if layout_choice == "two_sheet_joined":
         # 5. Tally Voucher Export (Sales OR Purchase)
         # -------------------------------------------------------------
         st.header("5. Tally Voucher Export")
-        
+
         config = TallyExportConfig(
             home_state_is_ut=home_state_is_ut,
             round_off_ledger_name=round_off_ledger_name,
         )
-        
+
         if voucher_type == "Sales":
             st.caption(
                 "Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
@@ -451,16 +469,16 @@ if layout_choice == "two_sheet_joined":
                 "Dr: Party, Cr: Sales + Output tax ledgers. "
                 "Only invoices with is_validated = True are exported."
             )
-            
+
             export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key="prep_tally_sales_btn")
             if export_clicked:
                 st.session_state["tally_export_results"] = generate_tally_sales_export(res.invoices, config)
-            
+
             tally_results = st.session_state.get("tally_export_results")
             if tally_results is not None:
                 for mode in ("B2B", "B2C"):
                     _display_export_results(tally_results[mode], mode, "Sales")
-        
+
         elif voucher_type == "Purchase":
             st.caption(
                 "Generates Tally-importable 'Accounting Voucher' rows for purchase invoices. "
@@ -468,16 +486,16 @@ if layout_choice == "two_sheet_joined":
                 "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
                 "Only invoices with is_validated = True are exported."
             )
-            
+
             export_clicked = st.button("Prepare Tally Purchase vouchers", type="primary", key="prep_tally_purchase_btn")
             if export_clicked:
                 st.session_state["tally_export_results"] = generate_tally_purchase_export(res.invoices, config)
-            
+
             tally_results = st.session_state.get("tally_export_results")
             if tally_results is not None:
                 for mode in ("B2B", "B2C"):
                     _display_export_results(tally_results[mode], mode, "Purchase")
-        
+
         else:
             st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
 
@@ -552,7 +570,7 @@ elif layout_choice == "single_sheet_grouped_blocks":
 else:
     st.info(
         "No sample file confirms this layout yet. One row = one line item, with "
-        "voucher-level fields (VOUCHERNUMBER, DATE, PARTYNAME, ...) repeated on every "
+        "voucher-level fields (VOUCHERNUMBER, VOUCHERDATE, PARTYNAME, ...) repeated on every "
         "row belonging to that voucher. The parser (orchestrator.parse_single_sheet_flat) "
         "is written to the same pattern as the other two layouts but UNTESTED against a "
         "real export — paste a mapping below once you have a candidate file."
@@ -562,7 +580,7 @@ else:
     flat_text = st.text_area(
         "Flat-sheet mapping", height=300,
         value=json.dumps({
-            "voucher_fields_column_map": {"VOUCHERNUMBER": 0, "DATE": 1, "PARTYNAME": 2},
+            "voucher_fields_column_map": {"VOUCHERNUMBER": 0, "VOUCHERDATE": 1, "PARTYNAME": 2},
             "item_row_column_map": {"STOCKITEMNAME": 3, "ACTUALQTY": 4, "RATE": 5, "AMOUNT": 6},
             "line_identifier_field": "STOCKITEMNAME",
             "data_start_row": 1,
