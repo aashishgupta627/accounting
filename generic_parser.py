@@ -179,8 +179,12 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
         record = {}
         for field_name, idx in col_map.items():
             val = row.iloc[idx]
-            record[field_name] = safe_float(val) if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT", "CESSAMOUNT"} else safe_str(val)
-
+            # Updated: include more numeric fields
+            if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT", "PARTYSTATECODE"}:
+                record[field_name] = safe_float(val) if field_name != "PARTYSTATECODE" else safe_str(val)
+            else:
+                record[field_name] = safe_str(val)
+            
         if tax_rate_breakup:
             buckets = []
             for bucket_map in tax_rate_breakup:
@@ -227,14 +231,15 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
 
         if voucher_no not in invoices:
             invoices[voucher_no] = {"VOUCHERNUMBER": voucher_no, "lines": []}
-            for f in ("PARTYNAME", "PARTYGSTIN", "DATE"):
+            # Updated: use VOUCHERDATE instead of DATE
+            for f in ("PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE"):
                 if f in col_map:
                     invoices[voucher_no][f] = safe_str(row.iloc[col_map[f]])
             order.append(voucher_no)
 
         line = {}
         for f, idx in col_map.items():
-            if f in {"VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN", "DATE"}:
+            if f in {"VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE"}:
                 continue
             val = row.iloc[idx]
             line[f] = safe_float(val) if f in NUMERIC_LINE_FIELDS else safe_str(val)
@@ -331,15 +336,16 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "difference": round(abs(adjusted_sum - expected_total), 2),
                 })
 
+        # Updated: use VOUCHERDATE instead of DATE, PARTYSTATECODE instead of STATECODE
         invoice = {
             "VOUCHERTYPE": voucher_type,
             "VOUCHERNUMBER": voucher_no,
             "REFERENCENUMBER": row.get("REFERENCENUMBER"),
             "REFERENCEDATE": row.get("REFERENCEDATE"),
-            "DATE": row.get("DATE") or detail.get("DATE"),
+            "VOUCHERDATE": row.get("VOUCHERDATE") or detail.get("VOUCHERDATE"),
             "PARTYNAME": row.get("PARTYNAME") or detail.get("PARTYNAME"),
             "PARTYGSTIN": row.get("PARTYGSTIN"),
-            "STATECODE": row.get("STATECODE"),
+            "PARTYSTATECODE": row.get("PARTYSTATECODE"),
             "BILLAMOUNT": expected_total,
             "ROUNDOFFAMOUNT": round_off,
             "tax_breakup": row.get("tax_breakup", []),
