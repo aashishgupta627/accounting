@@ -97,10 +97,12 @@ def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
 
 def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
     """Base row with common fields for sales vouchers."""
-    _, state_name = split_state(invoice.get("STATECODE"))
+    # Updated: Use PARTYSTATECODE instead of STATECODE
+    _, state_name = split_state(invoice.get("PARTYSTATECODE"))
     
     row = {
-        "Voucher Date": invoice.get("DATE"),
+        # Updated: Use VOUCHERDATE instead of DATE
+        "Voucher Date": invoice.get("VOUCHERDATE"),
         "Reference No.": None,
         "Voucher Type Name": invoice.get("VOUCHERTYPE") or "Sales",
         "Voucher Number": invoice.get("VOUCHERNUMBER"),
@@ -134,13 +136,15 @@ def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict
 
 def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
     """Base row with common fields for purchase vouchers."""
-    _, state_name = split_state(invoice.get("STATECODE"))
+    # Updated: Use PARTYSTATECODE instead of STATECODE
+    _, state_name = split_state(invoice.get("PARTYSTATECODE"))
     
     # For purchases, Reference No. and Voucher Number should be the same
     # Using REFERENCENUMBER from the invoice if available, otherwise VOUCHERNUMBER
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
     voucher_no = invoice.get("VOUCHERNUMBER")
-    voucher_date = invoice.get("REFERENCEDATE") or invoice.get("DATE")
+    # Updated: Use VOUCHERDATE and REFERENCEDATE
+    voucher_date = invoice.get("REFERENCEDATE") or invoice.get("VOUCHERDATE")
     
     row = {
         "Voucher Date": voucher_date,
@@ -412,7 +416,8 @@ def build_purchase_voucher_rows(
     
     # Get reference number and reference date for the voucher
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
-    ref_date = invoice.get("REFERENCEDATE") or invoice.get("DATE")
+    # Updated: Use VOUCHERDATE
+    ref_date = invoice.get("REFERENCEDATE") or invoice.get("VOUCHERDATE")
     
     # 1. Cr: Supplier ledger (full bill amount)
     cr_row = dict(base)
