@@ -43,27 +43,36 @@ NUMERIC_ITEM_FIELDS = {
     "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
 
+# Updated: VOUCHERDATE instead of DATE, PARTYSTATECODE instead of STATECODE
 VOUCHER_FIELDS = {
-    "DATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
-    "NARRATION", "ROUNDOFFAMOUNT", "BILLAMOUNT",
+    "VOUCHERDATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
+    "NARRATION", "ROUNDOFFAMOUNT", "BILLAMOUNT", "PARTYSTATECODE",
     "REFERENCENUMBER", "REFERENCEDATE",
 }
+
+# Updated: BATCHNAME, EXPIRYDATE, FREEQTY removed (now captured via extra_fields)
 ITEM_FIELDS = {
-    "STOCKITEMNAME", "BATCHNAME", "EXPIRYDATE", "ACTUALQTY", "FREEQTY",
+    "STOCKITEMNAME", "ACTUALQTY",
     "RATE", "GSTRATE", "AMOUNT", "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT",
     "HSNCODE", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
+
 LINE_IDENTIFIER_FIELDS = {"STOCKITEMNAME", "HSNCODE"}
-SUMMARY_FIELDS = {
-    "DATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
-    "BILLAMOUNT", "ROUNDOFFAMOUNT", "STATECODE", "CESSAMOUNT",
-    "REFERENCENUMBER", "REFERENCEDATE",
-}
+
+# SUMMARY_FIELDS removed; use VOUCHER_FIELDS directly instead
+# Keeping for backward compatibility but deprecated
+SUMMARY_FIELDS = VOUCHER_FIELDS  # For backward compatibility
+
 VOUCHER_TYPES_KNOWN = {"Purchase", "Sales", "Credit Note", "Debit Note"}  # informational only — not enforced as a closed set
+
 # One rate-bucket in a tax_rate_breakup entry. GSTRATE is a literal number
 # (the slab, e.g. 5), not a column index — everything else IS a column index.
 TAX_BREAKUP_FIELDS = {"TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"}
-GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {"DATE", "PARTYNAME", "PARTYGSTIN", "VOUCHERNUMBER"}
+
+# Updated: GROUPED_BLOCK_FIELDS computed from VOUCHER_FIELDS and ITEM_FIELDS
+GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {
+    "VOUCHERDATE", "PARTYNAME", "PARTYGSTIN", "VOUCHERNUMBER", "PARTYSTATECODE"
+}
 
 TRANSFORM_TYPES = {"identity", "strip_prefix", "regex_extract"}
 
@@ -294,7 +303,8 @@ def validate_summary_mapping(mapping: dict, sample_df: pd.DataFrame) -> Validati
         result.add_failure(f"header_row {header_row} out of range")
 
     col_map = mapping.get("column_map", {})
-    unknown = set(col_map) - SUMMARY_FIELDS
+    # Updated: use VOUCHER_FIELDS directly instead of SUMMARY_FIELDS
+    unknown = set(col_map) - VOUCHER_FIELDS
     if unknown:
         result.add_failure(
             f"column_map uses non-canonical keys: {unknown} "
@@ -395,6 +405,7 @@ def validate_grouped_blocks_mapping(mapping: dict, sample_df: pd.DataFrame) -> V
         result.add_failure(f"confidence {mapping.get('confidence')} below {MIN_CONFIDENCE}")
 
     col_map = mapping.get("column_map", {})
+    # Updated: use GROUPED_BLOCK_FIELDS
     unknown = set(col_map) - GROUPED_BLOCK_FIELDS
     if unknown:
         result.add_failure(
