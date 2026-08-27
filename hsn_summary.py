@@ -6,12 +6,23 @@ Generates reports in the same format as the sample CSV files:
 - B2C HSN summary
 
 Includes validation to ensure HSN summary totals match invoice totals.
+Uses the same B2B/B2C classification logic as tally_export.py for consistency.
 """
 
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+# Import classification functions from tally_export for consistency
+from tally_export import (
+    classify_sales_invoice,
+    classify_purchase_invoice,
+    has_gstin,
+    has_tax,
+    split_b2b_b2c_sales,
+    split_b2b_b2c_purchase,
+)
 
 
 @dataclass
@@ -60,36 +71,52 @@ def generate_hsn_summary(
     
     Uses BILLAMOUNT - ROUNDOFFAMOUNT as the base total for each invoice.
     This matches the sum of item NETAMOUNTs.
+    
+    Classification logic matches tally_export.py:
+    - Sales B2B: Has GSTIN
+    - Sales B2C: No GSTIN
+    - Purchase B2B: Has tax (GST rate > 0) OR has GSTIN
+    - Purchase B2C: No GSTIN AND no tax
     """
     
-    # Filter invoices by mode (B2B/B2C based on GSTIN presence)
+    # Filter invoices by mode using the appropriate classification
     filtered_invoices = []
-    total_invoice_value = 0.0  # This will be sum of (BILLAMOUNT - ROUNDOFFAMOUNT)
+    total_invoice_value = 0.0
     total_invoice_taxable = 0.0
     total_invoice_tax = 0.0
     
     for inv in invoices:
-        has_gstin = bool(inv.get("PARTYGSTIN") and str(inv.get("PARTYGSTIN")).strip())
-        if (mode == "B2B" and has_gstin) or (mode == "B2C" and not has_gstin):
-            if inv.get("is_validated") is True:
-                filtered_invoices.append(inv)
-                
-                # Use BILLAMOUNT - ROUNDOFFAMOUNT as the base total
-                bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
-                round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
-                base_total = bill_amount - round_off  # This should match sum of NETAMOUNTs
-                total_invoice_value += base_total
-                
-                # Calculate taxable and tax from tax_breakup
-                tax_breakup = inv.get("tax_breakup", [])
-                for bucket in tax_breakup:
-                    total_invoice_taxable += float(bucket.get("TAXABLEVALUE") or 0.0)
-                    total_invoice_tax += (
-                        float(bucket.get("CGSTAMOUNT") or 0.0) +
-                        float(bucket.get("SGSTAMOUNT") or 0.0) +
-                        float(bucket.get("IGSTAMOUNT") or 0.0) +
-                        float(bucket.get("CESSAMOUNT") or 0.0)
-                    )
+        # Skip non-validated invoices
+        if inv.get("is_validated") is not True:
+            continue
+        
+        # Determine if this invoice belongs to the requested mode
+        if voucher_type == "Sales":
+            inv_mode = classify_sales_invoice(inv)
+        else:  # Purchase
+            inv_mode = classify_purchase_invoice(inv)
+        
+        if inv_mode != mode:
+            continue
+        
+        filtered_invoices.append(inv)
+        
+        # Use BILLAMOUNT - ROUNDOFFAMOUNT as the base total
+        bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
+        round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
+        base_total = bill_amount - round_off
+        total_invoice_value += base_total
+        
+        # Calculate taxable and tax from tax_breakup
+        tax_breakup = inv.get("tax_breakup", [])
+        for bucket in tax_breakup:
+            total_invoice_taxable += float(bucket.get("TAXABLEVALUE") or 0.0)
+            total_invoice_tax += (
+                float(bucket.get("CGSTAMOUNT") or 0.0) +
+                float(bucket.get("SGSTAMOUNT") or 0.0) +
+                float(bucket.get("IGSTAMOUNT") or 0.0) +
+                float(bucket.get("CESSAMOUNT") or 0.0)
+            )
     
     # Aggregate by HSN code
     hsn_data = defaultdict(lambda: {
@@ -125,7 +152,7 @@ def generate_hsn_summary(
             missing_hsn_invoices.append({
                 "VOUCHERNUMBER": invoice_no,
                 "PARTYNAME": inv.get("PARTYNAME"),
-                "BILLAMOUNT": inv.get("BILLAMOUNT"),
+                "BILLAMOUNT": bill_amount,
                 "ROUNDOFFAMOUNT": round_off,
                 "BASE_TOTAL": invoice_base_total,
                 "issue": "No line items found"
@@ -185,7 +212,6 @@ def generate_hsn_summary(
             data["Invoice_Numbers"].add(invoice_no)
         
         # Validate this invoice's totals
-        # Compare invoice_base_total (BILLAMOUNT - ROUNDOFFAMOUNT) with HSN total
         if has_hsn and validate:
             hsn_invoice_total = sum(
                 hsn_data[hsn]["Total_Value"] 
@@ -197,7 +223,6 @@ def generate_hsn_summary(
             invoice_base_total_rounded = round(invoice_base_total, 2)
             hsn_invoice_total_rounded = round(hsn_invoice_total, 2)
             
-            # The difference should now be 0 or very small
             if abs(invoice_base_total_rounded - hsn_invoice_total_rounded) > 0.02:
                 mismatched_invoices.append({
                     "VOUCHERNUMBER": invoice_no,
@@ -257,7 +282,7 @@ def generate_hsn_summary(
     if not df.empty:
         df = df.sort_values("HSN").reset_index(drop=True)
     
-    # Calculate the difference - should now be 0 or very small
+    # Calculate the difference
     total_invoice_value_rounded = round(total_invoice_value, 2)
     total_hsn_value_rounded = round(total_hsn_value, 2)
     difference = total_invoice_value_rounded - total_hsn_value_rounded
@@ -273,7 +298,7 @@ def generate_hsn_summary(
             total_taxable_value=round(total_hsn_taxable, 2),
             total_tax_amount=round(total_hsn_tax, 2),
             difference=difference,
-            is_valid=abs(difference) < 0.01,  # Should be 0 now
+            is_valid=abs(difference) < 0.01,
             mismatched_invoices=mismatched_invoices,
             missing_hsn_invoices=missing_hsn_invoices
         )
