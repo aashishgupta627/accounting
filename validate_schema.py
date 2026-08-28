@@ -5,25 +5,44 @@ run deterministically against the full file?
 TERMINOLOGY — this distinction matters and is used consistently everywhere
 in this codebase:
 
-  CANONICAL SCHEMA  — fixed, singular, never changes per vendor. The field
-                       sets below (VOUCHER_FIELDS, ITEM_FIELDS,
-                       SUMMARY_FIELDS) ARE the schema. Every file — Purchase,
+  CANONICAL SCHEMA  — fixed, singular, never changes per vendor or per
+                       voucher direction. The field sets below (VOUCHER_FIELDS,
+                       ITEM_FIELDS) ARE the schema. Every file — Purchase,
                        Sales, a new pharma distributor, anything — maps into
-                       this exact same vocabulary.
+                       this exact same vocabulary. VOUCHERTYPE is what tells
+                       downstream code whether a voucher is Sales/Purchase/
+                       Credit Note/Debit Note; there is no separate field set
+                       per direction (no SUPPLIERNAME vs CUSTOMERNAME —
+                       PARTYNAME always means "the counterparty ledger").
 
   MAPPING           — per-file, and the only thing that varies. It's an
                        address book: "in THIS spreadsheet, STOCKITEMNAME
                        sits at column 2." A mapping is detected once per
-                       distinct layout (see the caching design in
-                       orchestrator.py) and reused for every future file
+                       distinct layout and reused for every future file
                        that shares that layout — it is not "a new schema
                        per vendor."
 
-  EXTRA_FIELDS      — an open, unvalidated bucket inside a mapping for a
-                       vendor's non-accounting extras (MARGIN1, SCM%,
-                       Is-Cash, ...) that aren't part of the canonical
-                       schema at all. Never checked against ITEM_FIELDS,
-                       never required, carried through verbatim.
+  EXTRA_FIELDS      — an open, unvalidated bucket inside a mapping for
+                       anything that isn't part of the canonical schema at
+                       all — vendor-specific accounting extras (MARGIN1,
+                       SCM%, Is-Cash, ...) AND pharma-domain specifics that
+                       don't feed the Tally voucher export (BATCHNAME,
+                       EXPIRYDATE, FREEQTY). Never checked against
+                       ITEM_FIELDS/VOUCHER_FIELDS, never required, carried
+                       through verbatim as best-effort strings.
+
+SCHEMA CHANGE (see conversation): DATE -> VOUCHERDATE and STATECODE ->
+PARTYSTATECODE, to match the Tally export columns they eventually feed
+("Voucher Date", "Buyer/Supplier - State"/"Place of Supply") and to be
+unambiguous once item-level dates exist too. BATCHNAME/EXPIRYDATE/FREEQTY
+dropped from ITEM_FIELDS — they're pharma-specific and don't appear in the
+Tally Accounting Voucher import at all; capture them via extra_fields
+instead. GROUPED_BLOCK_FIELDS and SUMMARY_FIELDS as separate field sets are
+retired — every sheet_type validates its column_map against the same
+VOUCHER_FIELDS / ITEM_FIELDS union, so the three can never drift apart
+again. This is a clean rename, no backward-compatible aliases for the
+field names themselves (old mappings using DATE/STATECODE/BATCHNAME/etc.
+as column_map or item_row_column_map keys must be updated).
 
 This module never calls an LLM. It only checks a mapping's shape against a
 small sample DataFrame (the same rows shown to the detector) and reports
@@ -38,41 +57,41 @@ from dataclasses import dataclass, field
 # extra_fields in the mapping instead) -------------------------------------
 
 NUMERIC_ITEM_FIELDS = {
-    "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT",
+    "ACTUALQTY", "RATE", "GSTRATE", "AMOUNT",
     "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT",
     "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
 
-# Updated: VOUCHERDATE instead of DATE, PARTYSTATECODE instead of STATECODE
+# Voucher-level fields — shared by ALL layout families (two_sheet_joined's
+# item_block_marker.fields AND consolidated_summary.column_map, plus
+# single_sheet_grouped_blocks.column_map). One vocabulary, no per-layout
+# duplication.
 VOUCHER_FIELDS = {
     "VOUCHERDATE", "VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN",
-    "NARRATION", "ROUNDOFFAMOUNT", "BILLAMOUNT", "PARTYSTATECODE",
-    "REFERENCENUMBER", "REFERENCEDATE",
+    "PARTYSTATECODE", "NARRATION", "ROUNDOFFAMOUNT", "BILLAMOUNT",
+    "REFERENCENUMBER", "REFERENCEDATE", "CESSAMOUNT",
 }
 
-# Updated: BATCHNAME, EXPIRYDATE, FREEQTY removed (now captured via extra_fields)
+# Item-level (line item) fields — same set used by item-detail rows in
+# two_sheet_joined AND by HSN-line rows in single_sheet_grouped_blocks.
+# Pharma-specific batch/expiry/free-quantity concepts are NOT here — they
+# go through extra_fields on whichever mapping happens to capture them.
 ITEM_FIELDS = {
-    "STOCKITEMNAME", "ACTUALQTY",
-    "RATE", "GSTRATE", "AMOUNT", "DISCOUNT", "TAXABLEVALUE", "GSTAMOUNT",
-    "HSNCODE", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
+    "STOCKITEMNAME", "ACTUALQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
+    "TAXABLEVALUE", "GSTAMOUNT", "HSNCODE", "NETAMOUNT",
+    "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT",
 }
-
 LINE_IDENTIFIER_FIELDS = {"STOCKITEMNAME", "HSNCODE"}
 
-# SUMMARY_FIELDS removed; use VOUCHER_FIELDS directly instead
-# Keeping for backward compatibility but deprecated
-SUMMARY_FIELDS = VOUCHER_FIELDS  # For backward compatibility
-
 VOUCHER_TYPES_KNOWN = {"Purchase", "Sales", "Credit Note", "Debit Note"}  # informational only — not enforced as a closed set
-
 # One rate-bucket in a tax_rate_breakup entry. GSTRATE is a literal number
 # (the slab, e.g. 5), not a column index — everything else IS a column index.
 TAX_BREAKUP_FIELDS = {"TAXABLEVALUE", "CGSTAMOUNT", "SGSTAMOUNT", "IGSTAMOUNT", "CESSAMOUNT"}
 
-# Updated: GROUPED_BLOCK_FIELDS computed from VOUCHER_FIELDS and ITEM_FIELDS
-GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {
-    "VOUCHERDATE", "PARTYNAME", "PARTYGSTIN", "VOUCHERNUMBER", "PARTYSTATECODE"
-}
+# single_sheet_grouped_blocks column_map draws from the same two pools as
+# every other layout — the voucher-level subset it happens to carry, plus
+# the item-level fields for its HSN-line rows.
+GROUPED_BLOCK_FIELDS = ITEM_FIELDS | {"VOUCHERDATE", "PARTYNAME", "PARTYGSTIN", "PARTYSTATECODE", "VOUCHERNUMBER"}
 
 TRANSFORM_TYPES = {"identity", "strip_prefix", "regex_extract"}
 
@@ -236,7 +255,8 @@ def validate_item_details_mapping(mapping: dict, sample_df: pd.DataFrame) -> Val
     if unknown_item_fields:
         result.add_failure(
             f"item_row_column_map uses non-canonical keys: {unknown_item_fields} "
-            f"— put vendor-specific extras in extra_fields instead"
+            f"— put vendor/domain-specific extras (e.g. BATCHNAME, EXPIRYDATE, "
+            f"FREEQTY) in extra_fields instead"
         )
 
     for f, idx in item_map.items():
@@ -303,7 +323,6 @@ def validate_summary_mapping(mapping: dict, sample_df: pd.DataFrame) -> Validati
         result.add_failure(f"header_row {header_row} out of range")
 
     col_map = mapping.get("column_map", {})
-    # Updated: use VOUCHER_FIELDS directly instead of SUMMARY_FIELDS
     unknown = set(col_map) - VOUCHER_FIELDS
     if unknown:
         result.add_failure(
@@ -405,7 +424,6 @@ def validate_grouped_blocks_mapping(mapping: dict, sample_df: pd.DataFrame) -> V
         result.add_failure(f"confidence {mapping.get('confidence')} below {MIN_CONFIDENCE}")
 
     col_map = mapping.get("column_map", {})
-    # Updated: use GROUPED_BLOCK_FIELDS
     unknown = set(col_map) - GROUPED_BLOCK_FIELDS
     if unknown:
         result.add_failure(
@@ -470,8 +488,10 @@ def validate_and_decide(mapping: dict, sample_df: pd.DataFrame):
     return r.passed, r
 
 
-# Backward-compatible aliases (old names, in case anything still imports
-# them directly) — prefer the *_mapping names above in new code.
+# Backward-compatible aliases (old FUNCTION names, in case anything still
+# imports them directly) — prefer the *_mapping names above in new code.
+# NOTE: this is unrelated to the DATE/STATECODE/BATCHNAME field rename,
+# which has NO aliases — see module docstring.
 validate_item_details_schema = validate_item_details_mapping
 validate_summary_schema = validate_summary_mapping
 validate_grouped_blocks_schema = validate_grouped_blocks_mapping
