@@ -88,6 +88,34 @@ def split_b2b_b2c(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
             b2c.append(inv)
     return b2b, b2c
 
+def split_b2b_b2c_purchase(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Split Purchase invoices into B2B and B2C.
+
+    Rule (differs from Sales):
+      1. If PARTYGSTIN is present -> B2B, always (overrides everything else).
+      2. Otherwise, if tax_breakup is non-empty -> B2B; if empty -> B2C.
+         (Option c: presence of a tax_breakup at all is enough, even a single
+         all-zero 0% bucket counts as B2B here.)
+
+    Note: split happens BEFORE build_purchase_voucher_rows runs, so invoices
+    with an empty tax_breakup still pass through this function -- they land
+    in B2C here, then get caught by skipped_no_tax_breakup downstream and
+    produce zero rows either way. This function's B2C bucket is a superset
+    of "will actually produce output rows."
+    """
+    b2b, b2c = [], []
+    for inv in invoices:
+        gstin = inv.get("PARTYGSTIN")
+        if gstin and str(gstin).strip():
+            b2b.append(inv)
+            continue
+        tax_breakup = inv.get("tax_breakup") or []
+        if tax_breakup:
+            b2b.append(inv)
+        else:
+            b2c.append(inv)
+    return b2b, b2c
 
 def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
     """Get CGST, SGST, IGST rates for a given GSTRATE."""
@@ -612,7 +640,7 @@ def generate_tally_purchase_export(
 ) -> Dict[str, Tuple[pd.DataFrame, TallyExportReport]]:
     """Generate Tally rows for purchase invoices."""
     config = config or TallyExportConfig()
-    b2b_invoices, b2c_invoices = split_b2b_b2c(invoices)
+    b2b_invoices, b2c_invoices = split_b2b_b2c_purchase(invoices)
 
     results = {}
     for mode, inv_list, columns in (
