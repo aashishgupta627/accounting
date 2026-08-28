@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from validate_schema import apply_transform, extract_blob_fields, validate_join_transform
 
 NUMERIC_LINE_FIELDS = {
-    "ACTUALQTY", "FREEQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
+    "ACTUALQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
     "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT",
     "IGSTAMOUNT", "CESSAMOUNT",
 }
@@ -40,7 +40,8 @@ def safe_str(value):
 def _extract_extra(row, extra_fields: dict) -> dict:
     """extra_fields: {literal_header_text: col_idx}. Values are captured
     as-is (best-effort string), never validated against the canonical
-    schema — this is exactly the vendor-specific overflow bucket."""
+    schema — this is exactly the vendor/domain-specific overflow bucket
+    (BATCHNAME, EXPIRYDATE, FREEQTY, MARGIN%, ...)."""
     if not extra_fields:
         return {}
     out = {}
@@ -179,12 +180,8 @@ def parse_summary(df_raw: pd.DataFrame, mapping: dict) -> list:
         record = {}
         for field_name, idx in col_map.items():
             val = row.iloc[idx]
-            # Updated: include more numeric fields
-            if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT", "PARTYSTATECODE"}:
-                record[field_name] = safe_float(val) if field_name != "PARTYSTATECODE" else safe_str(val)
-            else:
-                record[field_name] = safe_str(val)
-            
+            record[field_name] = safe_float(val) if field_name in {"BILLAMOUNT", "ROUNDOFFAMOUNT", "CESSAMOUNT"} else safe_str(val)
+
         if tax_rate_breakup:
             buckets = []
             for bucket_map in tax_rate_breakup:
@@ -215,6 +212,12 @@ def _item_net(item: dict) -> float:
     return item.get("AMOUNT", 0.0)
 
 
+# Voucher-level fields a grouped-blocks row can carry (forward-filled or
+# not) — same pool every other layout draws from, just the subset this
+# report happens to have.
+_GROUPED_VOUCHER_LEVEL_FIELDS = ("PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE")
+
+
 def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
     col_map = mapping["column_map"]
     extra_fields = mapping.get("extra_fields", {})
@@ -231,15 +234,14 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
 
         if voucher_no not in invoices:
             invoices[voucher_no] = {"VOUCHERNUMBER": voucher_no, "lines": []}
-            # Updated: use VOUCHERDATE instead of DATE
-            for f in ("PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE"):
+            for f in _GROUPED_VOUCHER_LEVEL_FIELDS:
                 if f in col_map:
                     invoices[voucher_no][f] = safe_str(row.iloc[col_map[f]])
             order.append(voucher_no)
 
         line = {}
         for f, idx in col_map.items():
-            if f in {"VOUCHERNUMBER", "PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE"}:
+            if f in {"VOUCHERNUMBER"} | set(_GROUPED_VOUCHER_LEVEL_FIELDS):
                 continue
             val = row.iloc[idx]
             line[f] = safe_float(val) if f in NUMERIC_LINE_FIELDS else safe_str(val)
@@ -336,7 +338,6 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "difference": round(abs(adjusted_sum - expected_total), 2),
                 })
 
-        # Updated: use VOUCHERDATE instead of DATE, PARTYSTATECODE instead of STATECODE
         invoice = {
             "VOUCHERTYPE": voucher_type,
             "VOUCHERNUMBER": voucher_no,
