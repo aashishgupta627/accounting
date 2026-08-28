@@ -43,10 +43,11 @@ def generate_hsn_summary(invoices, mode="B2B", voucher_type="Sales", validate=Tr
             round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
             total_invoice_value += bill_amount - round_off
 
+    # Key is now (HSN, GST rate) -- same HSN at different rates gets separate rows.
     hsn_data = defaultdict(lambda: {
         "Description": "", "UQC": "OTH-OTHERS", "Total_Quantity": 0.0, "Total_Value": 0.0,
         "Taxable_Value": 0.0, "IGST_Amount": 0.0, "CGST_Amount": 0.0, "SGST_Amount": 0.0,
-        "Cess_Amount": 0.0, "Rate": 0.0, "Rates": set(), "Invoice_Numbers": set(),
+        "Cess_Amount": 0.0, "Rate": 0.0, "Invoice_Numbers": set(),
     })
     mismatched_invoices = []
     missing_hsn_invoices = []
@@ -62,6 +63,7 @@ def generate_hsn_summary(invoices, mode="B2B", voucher_type="Sales", validate=Tr
             missing_hsn_invoices.append({"VOUCHERNUMBER": invoice_no, "issue": "No line items found"})
             continue
         has_hsn = False
+        invoice_hsn_total = 0.0  # this invoice's own contribution only -- not a shared-bucket lookup
         for item in items:
             hsn = item.get("HSNCODE")
             if not hsn:
@@ -78,30 +80,30 @@ def generate_hsn_summary(invoices, mode="B2B", voucher_type="Sales", validate=Tr
                 cgst_amount = sgst_amount = gst_amount / 2
                 igst_amount = 0.0
             description = item.get("STOCKITEMNAME") or ""
-            data = hsn_data[hsn]
+            key = (hsn, rate)
+            data = hsn_data[key]
             data["Description"] = description or data["Description"]
+            data["Rate"] = rate
             data["Total_Quantity"] += quantity
             data["Total_Value"] += amount
             data["Taxable_Value"] += taxable_value
             data["IGST_Amount"] += igst_amount
             data["CGST_Amount"] += cgst_amount
             data["SGST_Amount"] += sgst_amount
-            data["Rates"].add(rate)
             data["Invoice_Numbers"].add(invoice_no)
+            invoice_hsn_total += amount
         if has_hsn and validate:
-            hsn_invoice_total = sum(hsn_data[h]["Total_Value"] for h in hsn_data if invoice_no in hsn_data[h]["Invoice_Numbers"])
-            if abs(round(invoice_base_total, 2) - round(hsn_invoice_total, 2)) > 0.02:
+            if abs(round(invoice_base_total, 2) - round(invoice_hsn_total, 2)) > 0.02:
                 mismatched_invoices.append({
                     "VOUCHERNUMBER": invoice_no, "BASE_TOTAL": round(invoice_base_total, 2),
-                    "HSN_AGGREGATED": round(hsn_invoice_total, 2),
+                    "HSN_AGGREGATED": round(invoice_hsn_total, 2),
                 })
         if not has_hsn:
             missing_hsn_invoices.append({"VOUCHERNUMBER": invoice_no, "issue": "No HSN codes found"})
 
     rows = []
     total_hsn_value = 0.0
-    for hsn, data in hsn_data.items():
-        rate = max(data["Rates"]) if data["Rates"] else 0
+    for (hsn, rate), data in hsn_data.items():
         rows.append({
             "HSN": hsn, "Description": data["Description"][:50], "UQC": data["UQC"],
             "Total Quantity": round(data["Total_Quantity"], 2), "Total Value": round(data["Total_Value"], 2),
@@ -115,7 +117,7 @@ def generate_hsn_summary(invoices, mode="B2B", voucher_type="Sales", validate=Tr
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("HSN").reset_index(drop=True)
+        df = df.sort_values(["HSN", "Rate"]).reset_index(drop=True)
     difference = round(total_invoice_value, 2) - round(total_hsn_value, 2)
     validation_report = None
     if validate:
