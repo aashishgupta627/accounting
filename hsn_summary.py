@@ -2,6 +2,7 @@ import pandas as pd
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, field
+from tally_export import split_b2b_b2c, split_b2b_b2c_purchase
 
 @dataclass
 class HSNValidationReport:
@@ -27,16 +28,20 @@ def is_interstate(invoice):
     return False
 
 def generate_hsn_summary(invoices, mode="B2B", voucher_type="Sales", validate=True):
+    if voucher_type == "Purchase":
+        b2b_invoices, b2c_invoices = split_b2b_b2c_purchase(invoices)
+    else:
+        b2b_invoices, b2c_invoices = split_b2b_b2c(invoices)
+    candidates = b2b_invoices if mode == "B2B" else b2c_invoices
+
     filtered_invoices = []
     total_invoice_value = 0.0
-    for inv in invoices:
-        has_gstin = bool(inv.get("PARTYGSTIN") and str(inv.get("PARTYGSTIN")).strip())
-        if (mode == "B2B" and has_gstin) or (mode == "B2C" and not has_gstin):
-            if inv.get("is_validated") is True:
-                filtered_invoices.append(inv)
-                bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
-                round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
-                total_invoice_value += bill_amount - round_off
+    for inv in candidates:
+        if inv.get("is_validated") is True:
+            filtered_invoices.append(inv)
+            bill_amount = float(inv.get("BILLAMOUNT") or 0.0)
+            round_off = float(inv.get("ROUNDOFFAMOUNT") or 0.0)
+            total_invoice_value += bill_amount - round_off
 
     hsn_data = defaultdict(lambda: {
         "Description": "", "UQC": "OTH-OTHERS", "Total_Quantity": 0.0, "Total_Value": 0.0,
