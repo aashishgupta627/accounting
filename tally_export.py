@@ -23,17 +23,20 @@ class TallyExportConfig:
     balance_tolerance: float = 0.02        # rupees; Dr/Cr mismatches beyond this are flagged
 
 # Output column layout — matches the sample files exactly
+HSN_SAC_DETAILS_FIXED = "Specify details here"
+
 COMMON_COLUMNS = [
     "Voucher Date", "Reference No.", "Voucher Type Name", "Voucher Number",
     "Buyer/Supplier - Address", "Buyer/Supplier - Pincode",
     "Ledger Name", "IGST Rate", "CGST Rate", "SGST/UTGST Rate",
     "Ledger Amount", "Ledger Amount Dr/Cr",
     "Item Name", "Billed Quantity", "Item Rate", "Item Rate per",
+    "HSN/SAC Details", "HSN/SAC",
     "Voucher Narration", "Change Mode",
 ]
 B2B_IDENTITY_COLUMN = "Buyer/Supplier - GSTIN/UIN"
 B2C_IDENTITY_COLUMN = "Buyer/Supplier - GST Registration Type"
-TRAILING_COLUMNS = ["Buyer/Supplier - Country", "Buyer/Supplier - State", "Buyer/Supplier - Place of Supply"]
+TRAILING_COLUMNS = ["Buyer/Supplier - Country"]   # State & Place of Supply removed
 
 B2B_COLUMNS = COMMON_COLUMNS + [B2B_IDENTITY_COLUMN] + TRAILING_COLUMNS
 B2C_COLUMNS = COMMON_COLUMNS + [B2C_IDENTITY_COLUMN] + TRAILING_COLUMNS
@@ -123,8 +126,6 @@ def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict
         "Change Mode": "Accounting Invoice",
         "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
         "Buyer/Supplier - Country": config.country,
-        "Buyer/Supplier - State": state_name,
-        "Buyer/Supplier - Place of Supply": state_name,
     }
 
     if mode == "B2B":
@@ -166,8 +167,6 @@ def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> D
         "Change Mode": "Accounting Invoice",
         "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
         "Buyer/Supplier - Country": config.country,
-        "Buyer/Supplier - State": state_name,
-        "Buyer/Supplier - Place of Supply": state_name,
     }
 
     if mode == "B2B":
@@ -176,6 +175,52 @@ def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> D
         row[B2C_IDENTITY_COLUMN] = "Unregistered/Consumer"
 
     return row
+
+def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
+    """
+    Group an invoice's items by HSNCODE, summing AMOUNT per HSN.
+
+    If `rate` is given, only items whose GSTRATE matches are included (used for
+    B2B rows, split per rate bucket). If `rate` is None, ALL items are included
+    regardless of rate (used for the flat B2C 0% purchase ledger, per your
+    "option a" — always GST PURCHASE@0% but still split by HSN).
+
+    Items with a missing/blank HSNCODE are grouped together under `None` —
+    callers leave the HSN/SAC columns blank for that group rather than
+    fabricate a code.
+
+    Returns [(hsncode_or_None, summed_amount), ...] in first-seen order.
+    """
+    groups: Dict[Optional[str], float] = {}
+    order: List[Optional[str]] = []
+    for item in items:
+        if rate is not None and float(item.get("GSTRATE") or 0) != float(rate):
+            continue
+        hsn = item.get("HSNCODE")
+        hsn = str(hsn).strip() if hsn not in (None, "") else None
+        amt = float(item.get("AMOUNT") or 0.0)
+        if hsn not in groups:
+            groups[hsn] = 0.0
+            order.append(hsn)
+        groups[hsn] += amt
+    return [(hsn, groups[hsn]) for hsn in order]
+
+
+def _hsn_groups_reconciled(items: List[Dict], target_total: float, rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
+    """
+    group_items_by_hsn(), but the last group absorbs any rounding drift so the
+    HSN-split rows always sum exactly to target_total (the bucket's
+    TAXABLEVALUE, or the invoice's BILLAMOUNT for B2C). Falls back to a single
+    unsplit, HSN-blank row when items are missing/empty for this rate.
+    """
+    groups = group_items_by_hsn(items, rate=rate)
+    if not groups:
+        return [(None, target_total)]
+    diff = target_total - sum(amt for _, amt in groups)
+    if abs(diff) > 0.004:
+        hsn, amt = groups[-1]
+        groups[-1] = (hsn, amt + diff)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +302,19 @@ def build_sales_voucher_rows(
             })
 
         if taxable:
-            r = dict(base)
-            r["Ledger Name"] = sales_ledger_name(rate, interstate)
-            r["Ledger Amount"] = round(taxable, 2)
-            r["Ledger Amount Dr/Cr"] = "Cr"
-            rows.append(r)
-            total_cr += taxable
+            ledger_name = sales_ledger_name(rate, interstate)
+            for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate):
+                if not amt:
+                    continue
+                r = dict(base)
+                r["Ledger Name"] = ledger_name
+                r["Ledger Amount"] = round(amt, 2)
+                r["Ledger Amount Dr/Cr"] = "Cr"
+                if hsn:
+                    r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
+                    r["HSN/SAC"] = hsn
+                rows.append(r)
+                total_cr += amt
 
         if interstate:
             if igst:
@@ -428,13 +480,18 @@ def build_purchase_voucher_rows(
 
     # 2. Dr: Purchase + tax ledgers
     if mode == "B2C":
-        # B2C: No input tax, just purchase at 0%
-        r = dict(base)
-        r["Ledger Name"] = ZERO_RATE_PURCHASE_LEDGER
-        r["Ledger Amount"] = round(bill_amount, 2)
-        r["Ledger Amount Dr/Cr"] = "Dr"
-        rows.append(r)
-        total_dr += bill_amount
+        for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], bill_amount, rate=None):
+            if not amt:
+                continue
+            r = dict(base)
+            r["Ledger Name"] = ZERO_RATE_PURCHASE_LEDGER
+            r["Ledger Amount"] = round(amt, 2)
+            r["Ledger Amount Dr/Cr"] = "Dr"
+            if hsn:
+                r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
+                r["HSN/SAC"] = hsn
+            rows.append(r)
+            total_dr += amt
     else:
         # B2B: Full tax breakdown
         for bucket in tax_breakup:
@@ -458,16 +515,24 @@ def build_purchase_voucher_rows(
             tax_rates = get_tax_rates(tax_breakup, rate)
 
             # Purchase ledger (Dr)
+             # Purchase ledger (Dr) — one row per HSN within this rate bucket
             if taxable > 0:
-                r = dict(base)
-                r["Ledger Name"] = purchase_ledger_name(rate, interstate)
-                r["IGST Rate"] = tax_rates.get("igst_rate", 0)
-                r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
-                r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
-                r["Ledger Amount"] = round(taxable, 2)
-                r["Ledger Amount Dr/Cr"] = "Dr"
-                rows.append(r)
-                total_dr += taxable
+                ledger_name = purchase_ledger_name(rate, interstate)
+                for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate):
+                    if not amt:
+                        continue
+                    r = dict(base)
+                    r["Ledger Name"] = ledger_name
+                    r["IGST Rate"] = tax_rates.get("igst_rate", 0)
+                    r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
+                    r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
+                    r["Ledger Amount"] = round(amt, 2)
+                    r["Ledger Amount Dr/Cr"] = "Dr"
+                    if hsn:
+                        r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
+                        r["HSN/SAC"] = hsn
+                    rows.append(r)
+                    total_dr += amt
 
             # Input tax ledgers (Dr)
             if interstate:
