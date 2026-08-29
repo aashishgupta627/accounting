@@ -20,6 +20,15 @@ NUMERIC_LINE_FIELDS = {
     "IGSTAMOUNT", "CESSAMOUNT",
 }
 
+# Standard 15-character GSTIN shape: 2-digit state code, 10-char PAN,
+# 1 entity code, 1 literal 'Z', 1 checksum char. Some vendor grouped-block
+# exports put a bare state abbreviation (e.g. "PB") in the GSTIN column for
+# unregistered/consumer rows instead of leaving it blank -- that is not a
+# real GSTIN and must not be treated as one (it would wrongly classify a
+# B2C row as B2B downstream). Any value that doesn't match this shape is
+# treated as no-GSTIN.
+_GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$")
+
 
 def safe_float(value):
     if pd.isna(value):
@@ -35,6 +44,15 @@ def safe_str(value):
         return None
     s = str(value).strip()
     return s if s else None
+
+
+def clean_gstin(value):
+    """safe_str, plus rejects anything not shaped like a real GSTIN
+    (see _GSTIN_RE docstring above)."""
+    s = safe_str(value)
+    if s is None:
+        return None
+    return s if _GSTIN_RE.match(s.upper()) else None
 
 
 def _extract_extra(row, extra_fields: dict) -> dict:
@@ -218,10 +236,84 @@ def _item_net(item: dict) -> float:
 _GROUPED_VOUCHER_LEVEL_FIELDS = ("PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE")
 
 
+def _derive_rate(row, rate_bucket_columns: dict):
+    """rate_bucket_columns: {gst_rate_literal: col_idx}. Each row in this
+    layout resolves to exactly one non-zero rate-bucket column; return that
+    rate. If every bucket is zero/blank, the row's rate is genuinely 0%
+    (not "unknown") -- there's no ambiguity to raise on."""
+    if not rate_bucket_columns:
+        return None
+    for rate, idx in rate_bucket_columns.items():
+        val = row.iloc[idx]
+        if pd.notna(val) and safe_float(val) != 0:
+            return float(rate)
+    return 0.0
+
+
+def _derive_voucher_type(voucher_no: str, rule: dict):
+    """Declarative VOUCHERTYPE-from-VOUCHERNUMBER rule, e.g. {"pattern":
+    "^CRN", "match_value": "Credit Note", "default": "Sales"}."""
+    if not rule:
+        return None
+    pattern = rule.get("pattern")
+    if pattern and voucher_no and re.search(pattern, voucher_no):
+        return rule.get("match_value")
+    return rule.get("default")
+
+
+def _build_tax_breakup(items: list) -> list:
+    """Group an invoice's items by GSTRATE only (never by HSN — items stay
+    one-per-HSN, this is a coarser aggregation used solely for the
+    rate-wise Dr/Cr tax ledgers, same shape parse_summary produces for
+    two_sheet_joined)."""
+    buckets = {}
+    order = []
+    for item in items:
+        rate = item.get("GSTRATE")
+        if rate is None:
+            continue
+        if rate not in buckets:
+            buckets[rate] = {
+                "GSTRATE": rate, "TAXABLEVALUE": 0.0, "CGSTAMOUNT": 0.0,
+                "SGSTAMOUNT": 0.0, "IGSTAMOUNT": 0.0, "CESSAMOUNT": 0.0,
+            }
+            order.append(rate)
+        b = buckets[rate]
+        b["TAXABLEVALUE"] += item.get("TAXABLEVALUE") or 0.0
+        b["CGSTAMOUNT"] += item.get("CGSTAMOUNT") or 0.0
+        b["SGSTAMOUNT"] += item.get("SGSTAMOUNT") or 0.0
+        b["IGSTAMOUNT"] += item.get("IGSTAMOUNT") or 0.0
+        b["CESSAMOUNT"] += item.get("CESSAMOUNT") or 0.0
+    return [
+        {k: (round(v, 2) if isinstance(v, float) else v) for k, v in buckets[r].items()}
+        for r in order
+    ]
+
+
+def _validate_grouped_invoice(items: list, tolerance: float = 1.0) -> bool:
+    """Per-line taxable+tax vs stated NETAMOUNT consistency check, same
+    tolerance/shape reconcile_grouped_blocks already uses, but returning a
+    single is_validated flag per invoice (needed by tally_export/
+    hsn_summary, which both require is_validated is True)."""
+    for item in items:
+        taxable = item.get("TAXABLEVALUE") or 0.0
+        tax = (
+            (item.get("CGSTAMOUNT") or 0.0) + (item.get("SGSTAMOUNT") or 0.0)
+            + (item.get("IGSTAMOUNT") or 0.0) + (item.get("CESSAMOUNT") or 0.0)
+        )
+        stated = _item_net(item)
+        if stated and abs((taxable + tax) - stated) > tolerance:
+            return False
+    return True
+
+
 def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
     col_map = mapping["column_map"]
     extra_fields = mapping.get("extra_fields", {})
     voucher_col = col_map["VOUCHERNUMBER"]
+    rate_bucket_columns = mapping.get("rate_bucket_columns", {})
+    sign_flip_fields = set(mapping.get("sign_flip_fields", []))
+    voucher_type_rule = mapping.get("voucher_type_rule")
 
     invoices = {}
     order = []
@@ -233,10 +325,15 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
         voucher_no = str(voucher_no).strip()
 
         if voucher_no not in invoices:
-            invoices[voucher_no] = {"VOUCHERNUMBER": voucher_no, "lines": []}
+            invoices[voucher_no] = {
+                "VOUCHERTYPE": _derive_voucher_type(voucher_no, voucher_type_rule),
+                "VOUCHERNUMBER": voucher_no,
+                "items": [],
+            }
             for f in _GROUPED_VOUCHER_LEVEL_FIELDS:
                 if f in col_map:
-                    invoices[voucher_no][f] = safe_str(row.iloc[col_map[f]])
+                    raw = row.iloc[col_map[f]]
+                    invoices[voucher_no][f] = clean_gstin(raw) if f == "PARTYGSTIN" else safe_str(raw)
             order.append(voucher_no)
 
         line = {}
@@ -244,13 +341,30 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
             if f in {"VOUCHERNUMBER"} | set(_GROUPED_VOUCHER_LEVEL_FIELDS):
                 continue
             val = row.iloc[idx]
-            line[f] = safe_float(val) if f in NUMERIC_LINE_FIELDS else safe_str(val)
+            is_numeric = f in NUMERIC_LINE_FIELDS
+            parsed = safe_float(val) if is_numeric else safe_str(val)
+            if is_numeric and f in sign_flip_fields and parsed:
+                parsed = -parsed
+            line[f] = parsed
+        line.setdefault("STOCKITEMNAME", None)
+        if rate_bucket_columns:
+            line["GSTRATE"] = _derive_rate(row, rate_bucket_columns)
         extra = _extract_extra(row, extra_fields)
         if extra:
             line["extra"] = extra
-        invoices[voucher_no]["lines"].append(line)
+        invoices[voucher_no]["items"].append(line)
 
-    return [invoices[k] for k in order]
+    result = []
+    for k in order:
+        inv = invoices[k]
+        items = inv["items"]
+        inv["BILLAMOUNT"] = round(sum(_item_net(i) for i in items), 2)
+        inv["ROUNDOFFAMOUNT"] = 0.0
+        inv["tax_breakup"] = _build_tax_breakup(items)
+        inv["is_validated"] = _validate_grouped_invoice(items)
+        result.append(inv)
+
+    return result
 
 
 @dataclass
@@ -262,23 +376,30 @@ class GroupedBlocksReport:
 
 
 def reconcile_grouped_blocks(invoices: list, tolerance: float = 1.0) -> GroupedBlocksReport:
+    """Aggregate-level report mirroring _validate_grouped_invoice's
+    per-invoice is_validated check. Compares taxable+tax against NETAMOUNT
+    (falling back to AMOUNT+GSTAMOUNT / AMOUNT via _item_net) rather than
+    AMOUNT directly -- mappings are free to point AMOUNT at the same column
+    as TAXABLEVALUE (as this one does), which would make an AMOUNT-based
+    comparison tautological."""
     report = GroupedBlocksReport(total_invoices=len(invoices))
     for inv in invoices:
+        items = inv.get("items", inv.get("lines", []))
         ok = True
-        for line in inv["lines"]:
-            taxable = line.get("TAXABLEVALUE", 0.0)
+        for item in items:
+            taxable = item.get("TAXABLEVALUE") or 0.0
             tax = (
-                line.get("CGSTAMOUNT", 0.0) + line.get("SGSTAMOUNT", 0.0)
-                + line.get("IGSTAMOUNT", 0.0) + line.get("CESSAMOUNT", 0.0)
+                (item.get("CGSTAMOUNT") or 0.0) + (item.get("SGSTAMOUNT") or 0.0)
+                + (item.get("IGSTAMOUNT") or 0.0) + (item.get("CESSAMOUNT") or 0.0)
             )
-            stated_total = line.get("AMOUNT", 0.0)
+            stated_total = _item_net(item)
             if stated_total and abs((taxable + tax) - stated_total) > tolerance:
                 ok = False
                 report.mismatch_detail.append({
                     "VOUCHERNUMBER": inv["VOUCHERNUMBER"],
-                    "HSNCODE": line.get("HSNCODE"),
+                    "HSNCODE": item.get("HSNCODE"),
                     "taxable_plus_tax": round(taxable + tax, 2),
-                    "stated_amount": stated_total,
+                    "stated_amount": round(stated_total, 2),
                     "difference": round(abs((taxable + tax) - stated_total), 2),
                 })
         if ok:
