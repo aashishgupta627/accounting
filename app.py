@@ -32,7 +32,7 @@ st.caption(
 # Helper: display Tally export results for a single mode (B2B or B2C)
 # ---------------------------------------------------------------------------
 
-def _display_export_results(result: tuple, mode: str, voucher_type: str):
+def _display_export_results(result: tuple, mode: str, voucher_type_label: str, key_prefix: str):
     df_out, rpt = result
 
     st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
@@ -61,14 +61,14 @@ def _display_export_results(result: tuple, mode: str, voucher_type: str):
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
         st.download_button(
-            f"Download {mode} Tally {voucher_type} vouchers (.xlsx)",
+            f"Download {mode} Tally {voucher_type_label} vouchers (.xlsx)",
             data=buf.getvalue(),
-            file_name=f"Tally{voucher_type}Vouchers_{mode}.xlsx",
+            file_name=f"Tally{voucher_type_label.replace(' ', '')}Vouchers_{mode}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl_{voucher_type}_{mode}",
+            key=f"{key_prefix}_dl_{mode}",
         )
     else:
-        st.info(f"No {mode} {voucher_type} vouchers to export.")
+        st.info(f"No {mode} {voucher_type_label} vouchers to export.")
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,16 @@ def _display_export_results(result: tuple, mode: str, voucher_type: str):
 # ---------------------------------------------------------------------------
 
 def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: str,
-                                home_state_is_ut: bool, round_off_ledger_name: str):
+                                home_state_is_ut: bool, round_off_ledger_name: str,
+                                display_label: str = None):
+    """voucher_type: internal dispatch value, must be 'Sales' or 'Purchase'
+    (selects which generate_tally_*_export function runs — Tally export
+    only has these two Dr/Cr shapes). display_label: what the user sees in
+    captions/buttons/filenames — lets e.g. Credit Note invoices run through
+    the Sales Dr/Cr engine while still being labelled 'Credit Note'
+    everywhere in the UI. Defaults to voucher_type when not given."""
+    display_label = display_label or voucher_type
+
     st.header("4.5 HSN Summary Reports")
     st.caption(
         "Generate HSN-wise summary reports for B2B and B2C sales. "
@@ -178,20 +187,20 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
 
     if voucher_type == "Sales":
         st.caption(
-            "Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
-            "Tally-importable 'Accounting Voucher' rows. "
-            "Dr: Party, Cr: Sales + Output tax ledgers. "
-            "Only invoices with is_validated = True are exported."
+            f"Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
+            f"Tally-importable 'Accounting Voucher' rows for these {display_label} entries. "
+            f"Dr: Party, Cr: Sales + Output tax ledgers. "
+            f"Only invoices with is_validated = True are exported."
         )
 
-        export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key=f"{key_prefix}_prep_tally_sales_btn")
+        export_clicked = st.button(f"Prepare Tally {display_label} vouchers", type="primary", key=f"{key_prefix}_prep_tally_sales_btn")
         if export_clicked:
             st.session_state[f"{key_prefix}_tally_export_results"] = generate_tally_sales_export(invoices, config)
 
         tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
         if tally_results is not None:
             for mode in ("B2B", "B2C"):
-                _display_export_results(tally_results[mode], mode, "Sales")
+                _display_export_results(tally_results[mode], mode, display_label, key_prefix)
 
     elif voucher_type == "Purchase":
         st.caption(
@@ -201,14 +210,14 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
             "Only invoices with is_validated = True are exported."
         )
 
-        export_clicked = st.button("Prepare Tally Purchase vouchers", type="primary", key=f"{key_prefix}_prep_tally_purchase_btn")
+        export_clicked = st.button(f"Prepare Tally {display_label} vouchers", type="primary", key=f"{key_prefix}_prep_tally_purchase_btn")
         if export_clicked:
             st.session_state[f"{key_prefix}_tally_export_results"] = generate_tally_purchase_export(invoices, config)
 
         tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
         if tally_results is not None:
             for mode in ("B2B", "B2C"):
-                _display_export_results(tally_results[mode], mode, "Purchase")
+                _display_export_results(tally_results[mode], mode, display_label, key_prefix)
 
     else:
         st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
@@ -538,6 +547,7 @@ if layout_choice == "two_sheet_joined":
         _render_downstream_exports(
             res.invoices, voucher_type, key_prefix="ts",
             home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+            display_label=voucher_type,
         )
 
 # ===========================================================================
@@ -637,10 +647,19 @@ elif layout_choice == "single_sheet_grouped_blocks":
 
         for vt, invs in by_type.items():
             st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
+            # Tally export only has a Sales-shaped and a Purchase-shaped Dr/Cr
+            # engine — a Credit Note runs through the Sales engine (its
+            # amounts are already negative from the sign-flip/parsing step,
+            # so Dr/Cr comes out reversed correctly) but keeps its own label
+            # everywhere in the UI via display_label, and key_prefix (unique
+            # per vt) keeps its Streamlit widget keys from colliding with
+            # the real Sales bucket's.
+            dispatch_type = vt if vt in ("Sales", "Purchase") else "Sales"
             _render_downstream_exports(
-                invs, vt if vt in ("Sales", "Purchase") else "Sales",
+                invs, dispatch_type,
                 key_prefix=f"gb_{vt.replace(' ', '_')}",
                 home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                display_label=vt,
             )
 
 # ===========================================================================
