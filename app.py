@@ -29,11 +29,10 @@ st.caption(
 
 
 # ---------------------------------------------------------------------------
-# Helper function for displaying export results (defined BEFORE use)
+# Helper: display Tally export results for a single mode (B2B or B2C)
 # ---------------------------------------------------------------------------
 
 def _display_export_results(result: tuple, mode: str, voucher_type: str):
-    """Display Tally export results for a single mode (B2B or B2C)."""
     df_out, rpt = result
 
     st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
@@ -73,9 +72,156 @@ def _display_export_results(result: tuple, mode: str, voucher_type: str):
 
 
 # ---------------------------------------------------------------------------
+# Helper: HSN summary + Tally export sections, shared by every layout family
+# now that all three produce the same canonical invoice shape (items,
+# VOUCHERTYPE, BILLAMOUNT, tax_breakup, is_validated).
+# ---------------------------------------------------------------------------
+
+def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: str,
+                                home_state_is_ut: bool, round_off_ledger_name: str):
+    st.header("4.5 HSN Summary Reports")
+    st.caption(
+        "Generate HSN-wise summary reports for B2B and B2C sales. "
+        "Only invoices with is_validated = True are included. "
+        "Reports include validation to ensure totals match invoice data."
+    )
+
+    if voucher_type == "Sales":
+        if st.button("Generate HSN Summaries", type="primary", key=f"{key_prefix}_gen_hsn_btn"):
+            summaries = generate_all_hsn_summaries(invoices, voucher_type, validate=True)
+            st.session_state[f"{key_prefix}_hsn_summaries"] = summaries
+
+        if st.session_state.get(f"{key_prefix}_hsn_summaries") is not None:
+            summaries = st.session_state[f"{key_prefix}_hsn_summaries"]
+
+            for mode, (df, validation_report) in summaries.items():
+                st.subheader(f"{mode} HSN Summary")
+
+                if df.empty:
+                    st.info(f"No {mode} data available")
+                    continue
+
+                if validation_report:
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Total Invoices", validation_report.total_invoices)
+                    col2.metric("Invoice Total", f"₹{validation_report.total_invoice_value:,.2f}")
+                    col3.metric("HSN Total", f"₹{validation_report.total_hsn_value:,.2f}")
+                    col4.metric("Difference", f"₹{validation_report.difference:,.2f}")
+
+                    if validation_report.is_valid:
+                        st.success("✅ Validation PASSED: HSN totals match invoice totals")
+                    else:
+                        st.error(
+                            f"❌ Validation FAILED: HSN totals do not match invoice totals "
+                            f"(difference: ₹{validation_report.difference:,.2f})"
+                        )
+
+                    if validation_report.mismatched_invoices:
+                        with st.expander(f"⚠️ Mismatched invoices ({len(validation_report.mismatched_invoices)})"):
+                            st.dataframe(
+                                pd.DataFrame(validation_report.mismatched_invoices),
+                                use_container_width=True, hide_index=True,
+                            )
+
+                    if validation_report.missing_hsn_invoices:
+                        with st.expander(f"⚠️ Invoices without HSN codes ({len(validation_report.missing_hsn_invoices)})"):
+                            st.dataframe(
+                                pd.DataFrame(validation_report.missing_hsn_invoices),
+                                use_container_width=True, hide_index=True,
+                            )
+
+                total_value = df["Total Value"].sum()
+                total_taxable = df["Taxable Value"].sum()
+                total_tax = (
+                    df["Integrated Tax Amount"].sum()
+                    + df["Central Tax Amount"].sum()
+                    + df["State/UT Tax Amount"].sum()
+                )
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric(f"{mode} - Total Value", f"₹{total_value:,.2f}")
+                c2.metric(f"{mode} - Taxable Value", f"₹{total_taxable:,.2f}")
+                c3.metric(f"{mode} - Total Tax", f"₹{total_tax:,.2f}")
+
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                col1, col2 = st.columns(2)
+
+                csv = df.to_csv(index=False)
+                col1.download_button(
+                    f"Download {mode} HSN Summary (.csv)",
+                    data=csv,
+                    file_name=f"hsn_{mode.lower()}.csv",
+                    mime="text/csv",
+                    key=f"{key_prefix}_dl_hsn_{mode}",
+                )
+
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name=f"HSN_{mode}", index=False)
+                col2.download_button(
+                    f"Download {mode} HSN Summary (.xlsx)",
+                    data=buf.getvalue(),
+                    file_name=f"hsn_{mode.lower()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"{key_prefix}_dl_hsn_excel_{mode}",
+                )
+    else:
+        st.info(f"HSN summary generation is currently only implemented for Sales vouchers. Voucher type: {voucher_type}")
+
+    st.header("5. Tally Voucher Export")
+
+    config = TallyExportConfig(
+        home_state_is_ut=home_state_is_ut,
+        round_off_ledger_name=round_off_ledger_name,
+    )
+
+    if voucher_type == "Sales":
+        st.caption(
+            "Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
+            "Tally-importable 'Accounting Voucher' rows. "
+            "Dr: Party, Cr: Sales + Output tax ledgers. "
+            "Only invoices with is_validated = True are exported."
+        )
+
+        export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key=f"{key_prefix}_prep_tally_sales_btn")
+        if export_clicked:
+            st.session_state[f"{key_prefix}_tally_export_results"] = generate_tally_sales_export(invoices, config)
+
+        tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
+        if tally_results is not None:
+            for mode in ("B2B", "B2C"):
+                _display_export_results(tally_results[mode], mode, "Sales")
+
+    elif voucher_type == "Purchase":
+        st.caption(
+            "Generates Tally-importable 'Accounting Voucher' rows for purchase invoices. "
+            "B2B: Dr = Purchase ledger + Input tax ledgers, Cr = Supplier (full amount). "
+            "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
+            "Only invoices with is_validated = True are exported."
+        )
+
+        export_clicked = st.button("Prepare Tally Purchase vouchers", type="primary", key=f"{key_prefix}_prep_tally_purchase_btn")
+        if export_clicked:
+            st.session_state[f"{key_prefix}_tally_export_results"] = generate_tally_purchase_export(invoices, config)
+
+        tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
+        if tally_results is not None:
+            for mode in ("B2B", "B2C"):
+                _display_export_results(tally_results[mode], mode, "Purchase")
+
+    else:
+        st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
+
+
+# ---------------------------------------------------------------------------
 # Example mappings for the two real files already validated end-to-end
 # against Sales_July.xlsx and Purchase_July.xlsx (317/317 and 1181/1181
-# invoices reconciled, 0 Dr/Cr balance mismatches on either Tally export).
+# invoices reconciled, 0 Dr/Cr balance mismatches on either Tally export),
+# plus GST_Summary_Daily-II_july_2026.xls (single_sheet_grouped_blocks,
+# 550/550 invoices reconciled — 435 Sales + 115 Credit Note, 0 mismatches,
+# totals tie out exactly to the sheet's own Grand Total row: qty +8060,
+# Tot-Amt 10094369.72, Taxable-Amt 8554948.18).
 #
 # SCHEMA NOTE: DATE -> VOUCHERDATE, STATECODE -> PARTYSTATECODE (see
 # validate_schema.py's module docstring). BATCHNAME/EXPIRYDATE/FREEQTY are
@@ -91,6 +237,32 @@ def _display_export_results(result: tuple, mode: str, voucher_type: str):
 # 5-row report letterhead in the actual monthly exports — now header_row=5
 # (summary) / header_rows=[4,5], data_start_row=6 (items) for both Sales
 # and Purchase.
+#
+# GST SUMMARY MAPPING NOTES (single_sheet_grouped_blocks):
+#   - block_header_marker uses columns_present=[0] only (not [0,1] — B2C
+#     account blocks have a blank GSTIN cell at the header row, so
+#     requiring col 1 non-blank would drop those blocks). columns_blank
+#     now includes col 5 (Tot-Qty.) alongside col 2 (Date): real account
+#     header rows have it blank, but "Total :" / "Grand Total :" subtotal
+#     rows have col 0 non-blank AND col 2 blank too — col 5 is what
+#     actually distinguishes a header row from a subtotal row here.
+#   - GSTRATE has no dedicated column; it's derived from which of the six
+#     S.(0%)..S.(28%) rate-bucket columns is non-zero per row (confirmed:
+#     exactly one is, on every row) via rate_bucket_columns.
+#   - ACTUALQTY is stored negative for normal sales and positive for
+#     credit notes in this export (inverted vs. accounting convention) —
+#     sign_flip_fields corrects it.
+#   - VOUCHERTYPE is derived from the voucher-number prefix: CRN- ->
+#     "Credit Note", everything else -> "Sales".
+#   - AMOUNT is mapped to the same column as TAXABLEVALUE (col 7,
+#     Taxable-Amt.) since this vendor's "Amount" concept for HSN-grouping
+#     purposes is the taxable value, not the tax-inclusive Tot-Amt.
+#     NETAMOUNT carries Tot-Amt. (col 6, tax-inclusive) instead.
+#   - PARTYGSTIN gets sanity-checked against a real GSTIN shape by
+#     generic_parser.clean_gstin() — this file puts a bare state
+#     abbreviation ("PB") in the GSTIN column for B2C rows instead of
+#     leaving it blank; without that check those rows would be
+#     misclassified as B2B.
 # ---------------------------------------------------------------------------
 
 EXAMPLES = {
@@ -187,10 +359,10 @@ EXAMPLES = {
         "item_sheet_name": "Item Details",
         "summary_sheet_name": "Consolidated Summary",
     },
-    "GST Summary (single_sheet_grouped_blocks)": {
+    "GST Summary Daily (single_sheet_grouped_blocks)": {
         "layout_type": "single_sheet_grouped_blocks",
         "ingest_mapping": {
-            "block_header_marker": {"columns_present": [0, 1], "columns_blank": [2, 3]},
+            "block_header_marker": {"columns_present": [0], "columns_blank": [2, 5]},
             "block_footer_marker": {"column": 0, "contains": "Total"},
             "forward_fill_columns": {"PARTYNAME": 0, "PARTYGSTIN": 1},
         },
@@ -198,12 +370,17 @@ EXAMPLES = {
             "sheet_type": "single_sheet_grouped_blocks",
             "line_identifier_field": "HSNCODE",
             "column_map": {
-                "PARTYNAME": 0, "PARTYGSTIN": 1, "VOUCHERDATE": 2, "VOUCHERNUMBER": 3, "HSNCODE": 4,
-                "ACTUALQTY": 5, "AMOUNT": 6, "TAXABLEVALUE": 7, "CGSTAMOUNT": 8,
-                "SGSTAMOUNT": 9, "IGSTAMOUNT": 10, "CESSAMOUNT": 11, "GSTAMOUNT": 12,
+                "PARTYNAME": 0, "PARTYGSTIN": 1, "VOUCHERDATE": 2, "VOUCHERNUMBER": 3,
+                "HSNCODE": 4, "ACTUALQTY": 5, "NETAMOUNT": 6,
+                "TAXABLEVALUE": 7, "AMOUNT": 7,
+                "CGSTAMOUNT": 8, "SGSTAMOUNT": 9, "IGSTAMOUNT": 10, "CESSAMOUNT": 11,
+                "GSTAMOUNT": 12,
             },
+            "rate_bucket_columns": {0: 13, 3: 14, 5: 15, 12: 16, 18: 17, 28: 18},
+            "sign_flip_fields": ["ACTUALQTY"],
+            "voucher_type_rule": {"pattern": "^CRN", "match_value": "Credit Note", "default": "Sales"},
             "extra_fields": {"Is-Cash": 27},
-            "confidence": 0.9,
+            "confidence": 0.95,
         },
         "sheet_name": "ORIGINAL",
         "header_row": 6,
@@ -225,7 +402,7 @@ with st.sidebar:
     example_choice = st.selectbox("Load example mapping", ["(blank)"] + list(EXAMPLES.keys()))
 
     st.header("2b. Tally export settings")
-    st.caption("Used only by the Tally voucher export button (section 5 below).")
+    st.caption("Used only by the Tally voucher export section (section 5 below).")
     home_state_is_ut = st.radio(
         "Your registered state is a...",
         ["Union Territory (UTGST)", "State (SGST)"],
@@ -292,8 +469,8 @@ if layout_choice == "two_sheet_joined":
         st.session_state["ts_summary_mapping"] = summary_mapping
         st.session_state["ts_transform"] = transform
         st.session_state["ts_voucher_type"] = voucher_type
-        st.session_state.pop("tally_export_results", None)
-        st.session_state.pop("hsn_summaries", None)
+        st.session_state.pop("ts_hsn_summaries", None)
+        st.session_state.pop("ts_tally_export_results", None)
 
     # Render from session_state
     if st.session_state.get("ts_res") is not None:
@@ -358,146 +535,10 @@ if layout_choice == "two_sheet_joined":
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
 
-        # -------------------------------------------------------------
-        # 4.5 HSN Summary Export
-        # -------------------------------------------------------------
-        st.header("4.5 HSN Summary Reports")
-        st.caption(
-            "Generate HSN-wise summary reports for B2B and B2C sales. "
-            "Only invoices with is_validated = True are included. "
-            "Reports include validation to ensure totals match invoice data."
+        _render_downstream_exports(
+            res.invoices, voucher_type, key_prefix="ts",
+            home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
         )
-
-        if voucher_type == "Sales":
-            if st.button("Generate HSN Summaries", type="primary", key="gen_hsn_btn"):
-                summaries = generate_all_hsn_summaries(res.invoices, voucher_type, validate=True)
-                st.session_state["hsn_summaries"] = summaries
-
-            if st.session_state.get("hsn_summaries") is not None:
-                summaries = st.session_state["hsn_summaries"]
-
-                for mode, (df, validation_report) in summaries.items():
-                    st.subheader(f"{mode} HSN Summary")
-
-                    if df.empty:
-                        st.info(f"No {mode} data available")
-                        continue
-
-                    # Display validation results
-                    if validation_report:
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Total Invoices", validation_report.total_invoices)
-                        col2.metric("Invoice Total", f"₹{validation_report.total_invoice_value:,.2f}")
-                        col3.metric("HSN Total", f"₹{validation_report.total_hsn_value:,.2f}")
-                        col4.metric("Difference", f"₹{validation_report.difference:,.2f}")
-
-                        # Show validation status
-                        if validation_report.is_valid:
-                            st.success(f"✅ Validation PASSED: HSN totals match invoice totals")
-                        else:
-                            st.error(f"❌ Validation FAILED: HSN totals do not match invoice totals (difference: ₹{validation_report.difference:,.2f})")
-
-                        # Show details of mismatched invoices
-                        if validation_report.mismatched_invoices:
-                            with st.expander(f"⚠️ Mismatched invoices ({len(validation_report.mismatched_invoices)})"):
-                                st.dataframe(
-                                    pd.DataFrame(validation_report.mismatched_invoices),
-                                    use_container_width=True,
-                                    hide_index=True
-                                )
-
-                        if validation_report.missing_hsn_invoices:
-                            with st.expander(f"⚠️ Invoices without HSN codes ({len(validation_report.missing_hsn_invoices)})"):
-                                st.dataframe(
-                                    pd.DataFrame(validation_report.missing_hsn_invoices),
-                                    use_container_width=True,
-                                    hide_index=True
-                                )
-
-                    # Display metrics
-                    total_value = df["Total Value"].sum()
-                    total_taxable = df["Taxable Value"].sum()
-                    total_tax = df["Integrated Tax Amount"].sum() + df["Central Tax Amount"].sum() + df["State/UT Tax Amount"].sum()
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric(f"{mode} - Total Value", f"₹{total_value:,.2f}")
-                    c2.metric(f"{mode} - Taxable Value", f"₹{total_taxable:,.2f}")
-                    c3.metric(f"{mode} - Total Tax", f"₹{total_tax:,.2f}")
-
-                    # Show the table
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-
-                    # Download buttons
-                    col1, col2 = st.columns(2)
-
-                    csv = df.to_csv(index=False)
-                    col1.download_button(
-                        f"Download {mode} HSN Summary (.csv)",
-                        data=csv,
-                        file_name=f"hsn_{mode.lower()}.csv",
-                        mime="text/csv",
-                        key=f"dl_hsn_{mode}",
-                    )
-
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        df.to_excel(writer, sheet_name=f"HSN_{mode}", index=False)
-                    col2.download_button(
-                        f"Download {mode} HSN Summary (.xlsx)",
-                        data=buf.getvalue(),
-                        file_name=f"hsn_{mode.lower()}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_hsn_excel_{mode}",
-                    )
-        else:
-            st.info(f"HSN summary generation is currently only implemented for Sales vouchers. Voucher type: {voucher_type}")
-
-        # -------------------------------------------------------------
-        # 5. Tally Voucher Export (Sales OR Purchase)
-        # -------------------------------------------------------------
-        st.header("5. Tally Voucher Export")
-
-        config = TallyExportConfig(
-            home_state_is_ut=home_state_is_ut,
-            round_off_ledger_name=round_off_ledger_name,
-        )
-
-        if voucher_type == "Sales":
-            st.caption(
-                "Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
-                "Tally-importable 'Accounting Voucher' rows. "
-                "Dr: Party, Cr: Sales + Output tax ledgers. "
-                "Only invoices with is_validated = True are exported."
-            )
-
-            export_clicked = st.button("Prepare Tally Sales vouchers", type="primary", key="prep_tally_sales_btn")
-            if export_clicked:
-                st.session_state["tally_export_results"] = generate_tally_sales_export(res.invoices, config)
-
-            tally_results = st.session_state.get("tally_export_results")
-            if tally_results is not None:
-                for mode in ("B2B", "B2C"):
-                    _display_export_results(tally_results[mode], mode, "Sales")
-
-        elif voucher_type == "Purchase":
-            st.caption(
-                "Generates Tally-importable 'Accounting Voucher' rows for purchase invoices. "
-                "B2B: Dr = Purchase ledger + Input tax ledgers, Cr = Supplier (full amount). "
-                "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
-                "Only invoices with is_validated = True are exported."
-            )
-
-            export_clicked = st.button("Prepare Tally Purchase vouchers", type="primary", key="prep_tally_purchase_btn")
-            if export_clicked:
-                st.session_state["tally_export_results"] = generate_tally_purchase_export(res.invoices, config)
-
-            tally_results = st.session_state.get("tally_export_results")
-            if tally_results is not None:
-                for mode in ("B2B", "B2C"):
-                    _display_export_results(tally_results[mode], mode, "Purchase")
-
-        else:
-            st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
 
 # ===========================================================================
 # SINGLE_SHEET_GROUPED_BLOCKS
@@ -521,6 +562,12 @@ elif layout_choice == "single_sheet_grouped_blocks":
             "Grouped-blocks mapping (column_map into the canonical schema)", height=300,
             value=json.dumps(example["grouped_mapping"], indent=2) if example and "grouped_mapping" in example else "{}",
         )
+        st.caption(
+            "Optional extras beyond column_map: rate_bucket_columns (derive GSTRATE from "
+            "which rate-bucket column is non-zero), sign_flip_fields (negate a numeric "
+            "field, e.g. when qty sign is inverted vs. accounting convention), "
+            "voucher_type_rule (derive VOUCHERTYPE from a VOUCHERNUMBER pattern)."
+        )
 
     run = st.button("Run", type="primary", disabled=uploaded is None)
 
@@ -534,6 +581,14 @@ elif layout_choice == "single_sheet_grouped_blocks":
 
         raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
         res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
+
+        st.session_state["gb_res"] = res
+        st.session_state["gb_voucher_type_rule"] = grouped_mapping.get("voucher_type_rule")
+        st.session_state.pop("gb_hsn_summaries", None)
+        st.session_state.pop("gb_tally_export_results", None)
+
+    if st.session_state.get("gb_res") is not None:
+        res = st.session_state["gb_res"]
 
         st.header("3. Layer A")
         if not res.layer_a_ok:
@@ -553,16 +608,40 @@ elif layout_choice == "single_sheet_grouped_blocks":
             st.subheader("Mismatched lines (taxable + tax vs stated amount)")
             st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
 
+        voucher_types = sorted({inv.get("VOUCHERTYPE") for inv in res.invoices if inv.get("VOUCHERTYPE")})
+        if voucher_types:
+            vt_counts = pd.Series([inv.get("VOUCHERTYPE") for inv in res.invoices]).value_counts()
+            st.caption("Voucher types: " + ", ".join(f"{k} ({v})" for k, v in vt_counts.items()))
+
         st.header("4. Result")
         json_str = json.dumps(res.invoices, indent=2, default=str)
-        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json")
+        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="gb_dl_json")
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
 
-        multi_line = [i for i in res.invoices if len(i["lines"]) > 1]
-        if multi_line:
-            with st.expander(f"Multi-HSN invoices ({len(multi_line)} found) — grouping sanity check"):
-                st.json(multi_line[:3])
+        multi_item = [i for i in res.invoices if len(i.get("items", [])) > 1]
+        if multi_item:
+            with st.expander(f"Multi-HSN invoices ({len(multi_item)} found) — grouping sanity check"):
+                st.caption(
+                    "Each HSN stays a separate item even when several share the same GST "
+                    "rate within one invoice; tax_breakup aggregates by rate only."
+                )
+                st.json(multi_item[:3])
+
+        # Downstream exports need a single voucher_type per run. This layout
+        # mixes Sales and Credit Note in one file (via voucher_type_rule), so
+        # split and offer exports per voucher type found.
+        by_type = {}
+        for inv in res.invoices:
+            by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
+
+        for vt, invs in by_type.items():
+            st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
+            _render_downstream_exports(
+                invs, vt if vt in ("Sales", "Purchase") else "Sales",
+                key_prefix=f"gb_{vt.replace(' ', '_')}",
+                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+            )
 
 # ===========================================================================
 # SINGLE_SHEET_FLAT
