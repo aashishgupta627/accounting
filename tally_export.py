@@ -11,18 +11,13 @@ from dataclasses import dataclass, field
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Constants & Configuration
-# ---------------------------------------------------------------------------
-
 @dataclass
 class TallyExportConfig:
-    home_state_is_ut: bool = True          # True -> UTGST naming, False -> SGST naming
+    home_state_is_ut: bool = True
     country: str = "India"
     round_off_ledger_name: str = "Round Off"
-    balance_tolerance: float = 0.02        # rupees; Dr/Cr mismatches beyond this are flagged
+    balance_tolerance: float = 0.02
 
-# Output column layout — matches the sample files exactly
 HSN_SAC_DETAILS_FIXED = "Specify details here"
 
 COMMON_COLUMNS = [
@@ -36,7 +31,7 @@ COMMON_COLUMNS = [
 ]
 B2B_IDENTITY_COLUMN = "Buyer/Supplier - GSTIN/UIN"
 B2C_IDENTITY_COLUMN = "Buyer/Supplier - GST Registration Type"
-TRAILING_COLUMNS = ["Buyer/Supplier - Country"]   # State & Place of Supply removed
+TRAILING_COLUMNS = ["Buyer/Supplier - Country"]
 
 B2B_COLUMNS = COMMON_COLUMNS + [B2B_IDENTITY_COLUMN] + TRAILING_COLUMNS
 B2C_COLUMNS = COMMON_COLUMNS + [B2C_IDENTITY_COLUMN] + TRAILING_COLUMNS
@@ -55,19 +50,13 @@ class TallyExportReport:
     rows_written: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Utility Functions
-# ---------------------------------------------------------------------------
-
 def fmt_rate(x: float) -> str:
-    """5 -> '5', 2.5 -> '2.5', 9.0 -> '9'."""
     if float(x) == int(x):
         return str(int(x))
     return str(round(x, 2)).rstrip("0").rstrip(".")
 
 
 def split_state(statecode):
-    """'04-Chandigarh' -> ('04', 'Chandigarh'). Falls back gracefully."""
     if not statecode:
         return None, None
     s = str(statecode)
@@ -78,7 +67,6 @@ def split_state(statecode):
 
 
 def split_b2b_b2c(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-    """Split invoices into B2B and B2C based on PARTYGSTIN presence."""
     b2b, b2c = [], []
     for inv in invoices:
         gstin = inv.get("PARTYGSTIN")
@@ -89,21 +77,6 @@ def split_b2b_b2c(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return b2b, b2c
 
 def split_b2b_b2c_purchase(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Split Purchase invoices into B2B and B2C.
-
-    Rule (differs from Sales):
-      1. If PARTYGSTIN is present -> B2B, always (overrides everything else).
-      2. Otherwise, if tax_breakup is non-empty -> B2B; if empty -> B2C.
-         (Option c: presence of a tax_breakup at all is enough, even a single
-         all-zero 0% bucket counts as B2B here.)
-
-    Note: split happens BEFORE build_purchase_voucher_rows runs, so invoices
-    with an empty tax_breakup still pass through this function -- they land
-    in B2C here, then get caught by skipped_no_tax_breakup downstream and
-    produce zero rows either way. This function's B2C bucket is a superset
-    of "will actually produce output rows."
-    """
     b2b, b2c = [], []
     for inv in invoices:
         gstin = inv.get("PARTYGSTIN")
@@ -118,7 +91,6 @@ def split_b2b_b2c_purchase(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]
     return b2b, b2c
 
 def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
-    """Get CGST, SGST, IGST rates for a given GSTRATE."""
     for bucket in tax_breakup:
         if bucket.get("GSTRATE") == rate:
             return {
@@ -130,7 +102,6 @@ def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
 
 
 def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
-    """Base row with common fields for sales vouchers."""
     _, state_name = split_state(invoice.get("PARTYSTATECODE"))
 
     row = {
@@ -165,11 +136,8 @@ def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict
 
 
 def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
-    """Base row with common fields for purchase vouchers."""
     _, state_name = split_state(invoice.get("PARTYSTATECODE"))
 
-    # For purchases, Reference No. and Voucher Number should be the same
-    # Using REFERENCENUMBER from the invoice if available, otherwise VOUCHERNUMBER
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
     voucher_no = invoice.get("VOUCHERNUMBER")
     voucher_date = invoice.get("REFERENCEDATE") or invoice.get("VOUCHERDATE")
@@ -205,20 +173,6 @@ def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> D
     return row
 
 def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
-    """
-    Group an invoice's items by HSNCODE, summing AMOUNT per HSN.
-
-    If `rate` is given, only items whose GSTRATE matches are included (used for
-    B2B rows, split per rate bucket). If `rate` is None, ALL items are included
-    regardless of rate (used for the flat B2C 0% purchase ledger, per your
-    "option a" — always GST PURCHASE@0% but still split by HSN).
-
-    Items with a missing/blank HSNCODE are grouped together under `None` —
-    callers leave the HSN/SAC columns blank for that group rather than
-    fabricate a code.
-
-    Returns [(hsncode_or_None, summed_amount), ...] in first-seen order.
-    """
     groups: Dict[Optional[str], float] = {}
     order: List[Optional[str]] = []
     for item in items:
@@ -235,12 +189,6 @@ def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[
 
 
 def _hsn_groups_reconciled(items: List[Dict], target_total: float, rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
-    """
-    group_items_by_hsn(), but the last group absorbs any rounding drift so the
-    HSN-split rows always sum exactly to target_total (the bucket's
-    TAXABLEVALUE, or the invoice's BILLAMOUNT for B2C). Falls back to a single
-    unsplit, HSN-blank row when items are missing/empty for this rate.
-    """
     groups = group_items_by_hsn(items, rate=rate)
     if not groups:
         return [(None, target_total)]
@@ -251,12 +199,8 @@ def _hsn_groups_reconciled(items: List[Dict], target_total: float, rate: Optiona
     return groups
 
 
-# ---------------------------------------------------------------------------
-# Sales Voucher Export
-# ---------------------------------------------------------------------------
-
 SALES_LEDGER_OVERRIDES = {
-    5: "Local Sales  GST 5%",   # double space — confirmed from sample
+    5: "Local Sales  GST 5%",
     18: "Local Sales GST 18%",
 }
 ZERO_RATE_SALES_LEDGER = "Local Sales 0%"
@@ -271,7 +215,6 @@ def sales_ledger_name(rate: float, interstate: bool) -> str:
 
 
 def output_tax_ledger_name(component: str, rate: float) -> str:
-    """component: 'CGST' | 'SGST' | 'UTGST' | 'IGST'."""
     if component == "IGST":
         return f"Output IGST {fmt_rate(rate)}%"
     half = rate / 2
@@ -284,7 +227,6 @@ def build_sales_voucher_rows(
     config: TallyExportConfig,
     report: TallyExportReport
 ) -> List[Dict]:
-    """Build Tally rows for a sales invoice. Dr: Party, Cr: Sales + Tax ledgers."""
     voucher_no = invoice.get("VOUCHERNUMBER")
 
     if invoice.get("is_validated") is not True:
@@ -302,7 +244,6 @@ def build_sales_voucher_rows(
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
     party_name = invoice.get("PARTYNAME")
 
-    # 1. Dr: Party ledger (full bill amount)
     dr_row = dict(base)
     dr_row["Ledger Name"] = party_name
     dr_row["Ledger Amount"] = round(bill_amount, 2)
@@ -311,7 +252,6 @@ def build_sales_voucher_rows(
 
     total_cr = 0.0
 
-    # 2. Cr: Sales + tax ledgers
     for bucket in tax_breakup:
         rate = bucket.get("GSTRATE", 0)
         taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
@@ -320,7 +260,7 @@ def build_sales_voucher_rows(
         igst = float(bucket.get("IGSTAMOUNT") or 0.0)
         cess = float(bucket.get("CESSAMOUNT") or 0.0)
 
-        interstate = igst > 0
+        interstate = igst != 0
 
         if igst > 0 and (cgst > 0 or sgst > 0):
             report.gstin_state_mismatches.append({
@@ -377,7 +317,6 @@ def build_sales_voucher_rows(
             rows.append(r)
             total_cr += cess
 
-    # 3. Round Off
     residual = bill_amount - total_cr
     reported_round_off = float(invoice.get("ROUNDOFFAMOUNT") or 0.0)
 
@@ -394,7 +333,6 @@ def build_sales_voucher_rows(
         r["Ledger Amount Dr/Cr"] = "Dr" if residual < 0 else "Cr"
         rows.append(r)
 
-    # 4. Balance check
     dr_total = sum(r["Ledger Amount"] for r in rows if r["Ledger Amount Dr/Cr"] == "Dr")
     cr_total = sum(r["Ledger Amount"] for r in rows if r["Ledger Amount Dr/Cr"] == "Cr")
 
@@ -415,7 +353,6 @@ def generate_tally_sales_export(
     invoices: List[Dict],
     config: Optional[TallyExportConfig] = None
 ) -> Dict[str, Tuple[pd.DataFrame, TallyExportReport]]:
-    """Generate Tally rows for sales invoices."""
     config = config or TallyExportConfig()
     b2b_invoices, b2c_invoices = split_b2b_b2c(invoices)
 
@@ -434,19 +371,14 @@ def generate_tally_sales_export(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Purchase Voucher Export
-# ---------------------------------------------------------------------------
-
 PURCHASE_LEDGER_OVERRIDES = {
-    5: "GST PURCHASE@5%",   # matching the sample exactly
+    5: "GST PURCHASE@5%",
     18: "GST PURCHASE@18%",
 }
 ZERO_RATE_PURCHASE_LEDGER = "GST PURCHASE@0%"
 
 
 def purchase_ledger_name(rate: float, interstate: bool) -> str:
-    """Returns the purchase ledger name for the given rate."""
     if rate == 0:
         return ZERO_RATE_PURCHASE_LEDGER
     if interstate:
@@ -455,7 +387,6 @@ def purchase_ledger_name(rate: float, interstate: bool) -> str:
 
 
 def input_tax_ledger_name(component: str, rate: float) -> str:
-    """component: 'CGST' | 'SGST' | 'UTGST' | 'IGST'."""
     if component == "IGST":
         return f"INPUT IGST @{fmt_rate(rate)}%"
     half = rate / 2
@@ -468,14 +399,6 @@ def build_purchase_voucher_rows(
     config: TallyExportConfig,
     report: TallyExportReport
 ) -> List[Dict]:
-    """
-    Build Tally rows for a purchase invoice matching the sample format.
-
-    Dr: Purchase ledger + Input tax ledgers (B2B) or Purchase GST 0% (B2C)
-    Cr: Supplier ledger (full amount)
-
-    Note: Uses Reference No. and Reference Date from the invoice.
-    """
     voucher_no = invoice.get("VOUCHERNUMBER")
 
     if invoice.get("is_validated") is not True:
@@ -493,11 +416,9 @@ def build_purchase_voucher_rows(
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
     party_name = invoice.get("PARTYNAME")
 
-    # Get reference number and reference date for the voucher
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
     ref_date = invoice.get("REFERENCEDATE") or invoice.get("VOUCHERDATE")
 
-    # 1. Cr: Supplier ledger (full bill amount)
     cr_row = dict(base)
     cr_row["Ledger Name"] = party_name
     cr_row["Ledger Amount"] = round(bill_amount, 2)
@@ -506,7 +427,6 @@ def build_purchase_voucher_rows(
 
     total_dr = 0.0
 
-    # 2. Dr: Purchase + tax ledgers
     if mode == "B2C":
         for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], bill_amount, rate=None):
             if not amt:
@@ -521,7 +441,6 @@ def build_purchase_voucher_rows(
             rows.append(r)
             total_dr += amt
     else:
-        # B2B: Full tax breakdown
         for bucket in tax_breakup:
             rate = bucket.get("GSTRATE", 0)
             taxable = float(bucket.get("TAXABLEVALUE") or 0.0)
@@ -530,7 +449,7 @@ def build_purchase_voucher_rows(
             igst = float(bucket.get("IGSTAMOUNT") or 0.0)
             cess = float(bucket.get("CESSAMOUNT") or 0.0)
 
-            interstate = igst > 0
+            interstate = igst != 0
 
             if igst > 0 and (cgst > 0 or sgst > 0):
                 report.gstin_state_mismatches.append({
@@ -539,11 +458,8 @@ def build_purchase_voucher_rows(
                     "issue": "both IGST and CGST/SGST populated on the same rate bucket",
                 })
 
-            # Get tax rates for the rate columns
             tax_rates = get_tax_rates(tax_breakup, rate)
 
-            # Purchase ledger (Dr)
-             # Purchase ledger (Dr) — one row per HSN within this rate bucket
             if taxable > 0:
                 ledger_name = purchase_ledger_name(rate, interstate)
                 for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate):
@@ -562,7 +478,6 @@ def build_purchase_voucher_rows(
                     rows.append(r)
                     total_dr += amt
 
-            # Input tax ledgers (Dr)
             if interstate:
                 if igst:
                     r = dict(base)
@@ -599,7 +514,6 @@ def build_purchase_voucher_rows(
                 rows.append(r)
                 total_dr += cess
 
-    # 3. Round Off
     residual = bill_amount - total_dr
     reported_round_off = float(invoice.get("ROUNDOFFAMOUNT") or 0.0)
 
@@ -613,11 +527,9 @@ def build_purchase_voucher_rows(
         r = dict(base)
         r["Ledger Name"] = config.round_off_ledger_name
         r["Ledger Amount"] = round(abs(residual), 2)
-        # For purchases: if Cr > Dr (bill rounded down), Cr Round Off; if Dr > Cr, Dr Round Off
         r["Ledger Amount Dr/Cr"] = "Dr" if residual > 0 else "Cr"
         rows.append(r)
 
-    # 4. Balance check
     dr_total = sum(r["Ledger Amount"] for r in rows if r["Ledger Amount Dr/Cr"] == "Dr")
     cr_total = sum(r["Ledger Amount"] for r in rows if r["Ledger Amount Dr/Cr"] == "Cr")
 
@@ -638,7 +550,6 @@ def generate_tally_purchase_export(
     invoices: List[Dict],
     config: Optional[TallyExportConfig] = None
 ) -> Dict[str, Tuple[pd.DataFrame, TallyExportReport]]:
-    """Generate Tally rows for purchase invoices."""
     config = config or TallyExportConfig()
     b2b_invoices, b2c_invoices = split_b2b_b2c_purchase(invoices)
 
