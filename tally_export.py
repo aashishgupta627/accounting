@@ -172,7 +172,7 @@ def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> D
 
     return row
 
-def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
+def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None, value_field: str = "AMOUNT") -> List[Tuple[Optional[str], float]]:
     groups: Dict[Optional[str], float] = {}
     order: List[Optional[str]] = []
     for item in items:
@@ -180,7 +180,7 @@ def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[
             continue
         hsn = item.get("HSNCODE")
         hsn = str(hsn).strip() if hsn not in (None, "") else None
-        amt = float(item.get("AMOUNT") or 0.0)
+        amt = float(item.get(value_field) or 0.0)
         if hsn not in groups:
             groups[hsn] = 0.0
             order.append(hsn)
@@ -188,8 +188,8 @@ def group_items_by_hsn(items: List[Dict], rate: Optional[float] = None) -> List[
     return [(hsn, groups[hsn]) for hsn in order]
 
 
-def _hsn_groups_reconciled(items: List[Dict], target_total: float, rate: Optional[float] = None) -> List[Tuple[Optional[str], float]]:
-    groups = group_items_by_hsn(items, rate=rate)
+def _hsn_groups_reconciled(items: List[Dict], target_total: float, rate: Optional[float] = None, value_field: str = "AMOUNT") -> List[Tuple[Optional[str], float]]:
+    groups = group_items_by_hsn(items, rate=rate, value_field=value_field)
     if not groups:
         return [(None, target_total)]
     diff = target_total - sum(amt for _, amt in groups)
@@ -271,7 +271,7 @@ def build_sales_voucher_rows(
 
         if taxable:
             ledger_name = sales_ledger_name(rate, interstate)
-            for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate):
+            for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate, value_field="TAXABLEVALUE"):
                 if not amt:
                     continue
                 r = dict(base)
@@ -428,7 +428,7 @@ def build_purchase_voucher_rows(
     total_dr = 0.0
 
     if mode == "B2C":
-        for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], bill_amount, rate=None):
+        for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], bill_amount, rate=None, value_field="AMOUNT"):
             if not amt:
                 continue
             r = dict(base)
@@ -462,7 +462,7 @@ def build_purchase_voucher_rows(
 
             if taxable > 0:
                 ledger_name = purchase_ledger_name(rate, interstate)
-                for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate):
+                for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate, value_field="TAXABLEVALUE"):
                     if not amt:
                         continue
                     r = dict(base)
