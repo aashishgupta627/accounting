@@ -261,6 +261,74 @@ def _derive_voucher_type(voucher_no: str, rule: dict):
     return rule.get("default")
 
 
+# ---------------------------------------------------------------------------
+# VOUCHERTYPE sign resolution — shared by every layout.
+#
+# A Credit Note is a Sales voucher with a negative total; a Debit Note is
+# a Purchase voucher with a negative total. Several vendor exports encode
+# this directly (BILLAMOUNT and every tax_breakup bucket come through
+# negative for a return/adjustment row — confirmed against a real
+# GST_Summary_Daily export, where "CRN-" prefixed rows have negative
+# Tot-Amt/Taxable-Amt/tax columns while ordinary "GST-" rows are positive;
+# only the Tot-Qty column is inverted, which sign_flip_fields already
+# corrects). Rather than re-deriving this per layout, one declarative rule
+# is reused everywhere: the mapping's "base" voucher type (Sales/Purchase)
+# plus the sign of BILLAMOUNT is enough on its own, and if a layout *also*
+# has an explicit VOUCHERNUMBER pattern (e.g. "CRN-"), the two signals
+# cross-check each other instead of one silently overriding the other —
+# same "don't let one signal mask a data problem" approach as
+# clean_gstin() and the interstate = igst != 0 fix.
+# ---------------------------------------------------------------------------
+
+_NEGATIVE_VOUCHER_TYPE = {"Sales": "Credit Note", "Purchase": "Debit Note"}
+
+
+def resolve_voucher_type(base_type, amount, pattern_type=None, tolerance=0.01):
+    """Resolve VOUCHERTYPE from up to two independent signals:
+      - pattern_type: derived from VOUCHERNUMBER (e.g. a 'CRN-' prefix ->
+        'Credit Note'), or None if no pattern rule is configured / fired.
+      - sign of `amount` (BILLAMOUNT) relative to `base_type`: a Sales
+        file/voucher with a negative total is a Credit Note; a Purchase
+        file/voucher with a negative total is a Debit Note.
+
+    Returns (voucher_type, mismatch: bool). On mismatch the pattern-derived
+    type wins (a VOUCHERNUMBER prefix is an explicit business convention;
+    a sign disagreement is more likely a data-entry slip), but
+    mismatch=True lets callers surface it as a data-quality flag instead
+    of silently swallowing the disagreement.
+    """
+    sign_type = None
+    if base_type in _NEGATIVE_VOUCHER_TYPE and amount is not None:
+        if amount < -tolerance:
+            sign_type = _NEGATIVE_VOUCHER_TYPE[base_type]
+        elif amount > tolerance:
+            sign_type = base_type
+        # amount ~ 0 -> genuinely ambiguous (e.g. a fully rounded-off
+        # invoice); treat as "no signal" rather than forcing a guess
+
+    if pattern_type and sign_type and pattern_type != sign_type:
+        return pattern_type, True
+    return pattern_type or sign_type or base_type, False
+
+
+def _amount_sign_consistent(amount, tax_breakup, tolerance=0.01):
+    """A Credit/Debit Note should have every tax_breakup bucket negative,
+    not just the BILLAMOUNT total — this catches a partial/mixed-sign
+    data entry error that a total-only sign check would miss. Returns
+    True if consistent (including the trivial case of no buckets or a
+    ~zero amount, where there's nothing meaningful to compare)."""
+    if not tax_breakup or amount is None or abs(amount) <= tolerance:
+        return True
+    expected_negative = amount < 0
+    for bucket in tax_breakup:
+        taxable = bucket.get("TAXABLEVALUE") or 0.0
+        if abs(taxable) <= tolerance:
+            continue
+        if (taxable < 0) != expected_negative:
+            return False
+    return True
+
+
 def _build_tax_breakup(items: list) -> list:
     """Group an invoice's items by GSTRATE only (never by HSN — items stay
     one-per-HSN, this is a coarser aggregation used solely for the
@@ -314,6 +382,13 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
     rate_bucket_columns = mapping.get("rate_bucket_columns", {})
     sign_flip_fields = set(mapping.get("sign_flip_fields", []))
     voucher_type_rule = mapping.get("voucher_type_rule")
+    # Optional: which base voucher type (Sales/Purchase) a *positive*
+    # BILLAMOUNT represents in this file, so the pattern-based VOUCHERTYPE
+    # above can be cross-checked against the sign of the invoice total
+    # once it's known (see resolve_voucher_type). Omit this key on a
+    # mapping to skip the sign cross-check entirely (e.g. a layout with
+    # no returns at all).
+    sign_base_type = (voucher_type_rule or {}).get("sign_base_type")
 
     invoices = {}
     order = []
@@ -362,6 +437,18 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
         inv["ROUNDOFFAMOUNT"] = 0.0
         inv["tax_breakup"] = _build_tax_breakup(items)
         inv["is_validated"] = _validate_grouped_invoice(items)
+
+        if sign_base_type:
+            resolved_type, mismatch = resolve_voucher_type(
+                sign_base_type, inv["BILLAMOUNT"], pattern_type=inv["VOUCHERTYPE"]
+            )
+            inv["VOUCHERTYPE"] = resolved_type
+            if mismatch or not _amount_sign_consistent(inv["BILLAMOUNT"], inv["tax_breakup"]):
+                inv.setdefault("extra", {})["voucher_type_flag"] = (
+                    "VOUCHERNUMBER pattern and BILLAMOUNT sign disagree" if mismatch
+                    else "tax_breakup bucket sign inconsistent with BILLAMOUNT"
+                )
+
         result.append(inv)
 
     return result
@@ -417,6 +504,10 @@ class LayerBReport:
     reconciled_invoices: int = 0
     mismatched_invoices: int = 0
     mismatch_detail: list = field(default_factory=list)
+    # Invoices where VOUCHERTYPE was resolved with a sign/pattern
+    # disagreement, or where tax_breakup bucket signs don't match
+    # BILLAMOUNT's sign — see resolve_voucher_type / _amount_sign_consistent.
+    voucher_type_flags: list = field(default_factory=list)
 
 
 def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
@@ -459,8 +550,26 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "difference": round(abs(adjusted_sum - expected_total), 2),
                 })
 
+        # A Sales/Purchase file can still contain negative-total rows —
+        # returns/adjustments recorded inline rather than as a separate
+        # report. Resolve the real VOUCHERTYPE from BILLAMOUNT's sign
+        # relative to the mapping's base type, and flag it if the tax
+        # columns don't agree with the total (see resolve_voucher_type /
+        # _amount_sign_consistent docstrings above).
+        resolved_type, type_mismatch = resolve_voucher_type(voucher_type, expected_total)
+        tax_breakup = row.get("tax_breakup", [])
+        sign_ok = _amount_sign_consistent(expected_total, tax_breakup)
+        if type_mismatch or not sign_ok:
+            report.voucher_type_flags.append({
+                "VOUCHERNUMBER": voucher_no,
+                "base_type": voucher_type,
+                "resolved_type": resolved_type,
+                "BILLAMOUNT": expected_total,
+                "reason": "pattern/sign disagree" if type_mismatch else "tax_breakup sign inconsistent",
+            })
+
         invoice = {
-            "VOUCHERTYPE": voucher_type,
+            "VOUCHERTYPE": resolved_type,
             "VOUCHERNUMBER": voucher_no,
             "REFERENCENUMBER": row.get("REFERENCENUMBER"),
             "REFERENCEDATE": row.get("REFERENCEDATE"),
@@ -470,7 +579,7 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
             "PARTYSTATECODE": row.get("PARTYSTATECODE"),
             "BILLAMOUNT": expected_total,
             "ROUNDOFFAMOUNT": round_off,
-            "tax_breakup": row.get("tax_breakup", []),
+            "tax_breakup": tax_breakup,
             "items": items,
             "items_calculated_total": round(calculated_sum, 2),
             "is_validated": is_valid if items else None,
