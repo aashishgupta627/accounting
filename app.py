@@ -27,6 +27,12 @@ st.caption(
     "(exactly what an LLM detection call would return) until that call is wired in."
 )
 
+# A reversing voucher (Credit Note / Debit Note) runs through the same
+# Dr/Cr engine as the voucher type it reverses -- tally_export.py flips
+# Dr/Cr from the signed BILLAMOUNT/tax_breakup values, it doesn't need
+# its own code path. This just says which engine to dispatch through.
+_REVERSAL_DISPATCH_TYPE = {"Credit Note": "Sales", "Debit Note": "Purchase"}
+
 
 # ---------------------------------------------------------------------------
 # Helper: display Tally export results for a single mode (B2B or B2C)
@@ -82,7 +88,9 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
                                 display_label: str = None):
     """voucher_type: internal dispatch value, must be 'Sales' or 'Purchase'
     (selects which generate_tally_*_export function runs — Tally export
-    only has these two Dr/Cr shapes). display_label: what the user sees in
+    only has these two Dr/Cr shapes; a Credit Note dispatches through
+    'Sales' and a Debit Note through 'Purchase' — see
+    _REVERSAL_DISPATCH_TYPE above). display_label: what the user sees in
     captions/buttons/filenames — lets e.g. Credit Note invoices run through
     the Sales Dr/Cr engine while still being labelled 'Credit Note'
     everywhere in the UI. Defaults to voucher_type when not given."""
@@ -189,7 +197,8 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
         st.caption(
             f"Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
             f"Tally-importable 'Accounting Voucher' rows for these {display_label} entries. "
-            f"Dr: Party, Cr: Sales + Output tax ledgers. "
+            f"Dr: Party, Cr: Sales + Output tax ledgers (flipped for a Credit Note, whose "
+            f"BILLAMOUNT/tax_breakup arrive negative — see tally_export.py's module docstring). "
             f"Only invoices with is_validated = True are exported."
         )
 
@@ -207,6 +216,7 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
             "Generates Tally-importable 'Accounting Voucher' rows for purchase invoices. "
             "B2B: Dr = Purchase ledger + Input tax ledgers, Cr = Supplier (full amount). "
             "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
+            "Flipped for a Debit Note, whose BILLAMOUNT/tax_breakup arrive negative. "
             "Only invoices with is_validated = True are exported."
         )
 
@@ -260,9 +270,15 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
 #     exactly one is, on every row) via rate_bucket_columns.
 #   - ACTUALQTY is stored negative for normal sales and positive for
 #     credit notes in this export (inverted vs. accounting convention) —
-#     sign_flip_fields corrects it.
+#     sign_flip_fields corrects it. Confirmed against the real file: every
+#     other amount column (Tot-Amt/Taxable-Amt/CGST/SGST/IGST/GST-Amt) is
+#     already the sane way round — positive for a normal sale row,
+#     negative for a CRN- row — no flip needed there.
 #   - VOUCHERTYPE is derived from the voucher-number prefix: CRN- ->
-#     "Credit Note", everything else -> "Sales".
+#     "Credit Note", everything else -> "Sales". sign_base_type: "Sales"
+#     cross-checks that against the sign of the invoice's own BILLAMOUNT
+#     once it's computed (see generic_parser.resolve_voucher_type) — on
+#     this file the two signals agree on every row checked.
 #   - AMOUNT is mapped to the same column as TAXABLEVALUE (col 7,
 #     Taxable-Amt.) since this vendor's "Amount" concept for HSN-grouping
 #     purposes is the taxable value, not the tax-inclusive Tot-Amt.
@@ -387,7 +403,10 @@ EXAMPLES = {
             },
             "rate_bucket_columns": {0: 13, 3: 14, 5: 15, 12: 16, 18: 17, 28: 18},
             "sign_flip_fields": ["ACTUALQTY"],
-            "voucher_type_rule": {"pattern": "^CRN", "match_value": "Credit Note", "default": "Sales"},
+            "voucher_type_rule": {
+                "pattern": "^CRN", "match_value": "Credit Note", "default": "Sales",
+                "sign_base_type": "Sales",
+            },
             "extra_fields": {"Is-Cash": 27},
             "confidence": 0.95,
         },
@@ -538,17 +557,40 @@ if layout_choice == "two_sheet_joined":
             st.subheader("Mismatched invoices")
             st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
 
+        if report.voucher_type_flags:
+            with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(report.voucher_type_flags)})"):
+                st.caption(
+                    "Invoices where the BILLAMOUNT sign disagreed with the expected VOUCHERTYPE, "
+                    "or where tax_breakup buckets don't all share BILLAMOUNT's sign. Review before "
+                    "exporting to Tally — see generic_parser.resolve_voucher_type."
+                )
+                st.dataframe(pd.DataFrame(report.voucher_type_flags), use_container_width=True, hide_index=True)
+
         st.header("4. Result")
         json_str = json.dumps(res.invoices, indent=2, default=str)
         st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="dl_json")
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
 
-        _render_downstream_exports(
-            res.invoices, voucher_type, key_prefix="ts",
-            home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-            display_label=voucher_type,
-        )
+        # Downstream exports need a single voucher_type per run, and a
+        # negative-BILLAMOUNT row now resolves to "Credit Note"/"Debit
+        # Note" (see generic_parser.resolve_voucher_type) rather than the
+        # file's base "Sales"/"Purchase" type -- split and offer exports
+        # per resolved type found, same pattern as single_sheet_grouped_blocks
+        # below.
+        by_type = {}
+        for inv in res.invoices:
+            by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
+
+        for vt, invs in by_type.items():
+            st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
+            dispatch_type = vt if vt in ("Sales", "Purchase") else _REVERSAL_DISPATCH_TYPE.get(vt, voucher_type)
+            _render_downstream_exports(
+                invs, dispatch_type,
+                key_prefix=f"ts_{vt.replace(' ', '_')}",
+                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                display_label=vt,
+            )
 
 # ===========================================================================
 # SINGLE_SHEET_GROUPED_BLOCKS
@@ -576,7 +618,9 @@ elif layout_choice == "single_sheet_grouped_blocks":
             "Optional extras beyond column_map: rate_bucket_columns (derive GSTRATE from "
             "which rate-bucket column is non-zero), sign_flip_fields (negate a numeric "
             "field, e.g. when qty sign is inverted vs. accounting convention), "
-            "voucher_type_rule (derive VOUCHERTYPE from a VOUCHERNUMBER pattern)."
+            "voucher_type_rule (derive VOUCHERTYPE from a VOUCHERNUMBER pattern, optionally "
+            "cross-checked against BILLAMOUNT's sign via voucher_type_rule.sign_base_type — "
+            "'Sales' or 'Purchase')."
         )
 
     run = st.button("Run", type="primary", disabled=uploaded is None)
@@ -638,9 +682,31 @@ elif layout_choice == "single_sheet_grouped_blocks":
                 )
                 st.json(multi_item[:3])
 
+        flagged = [inv for inv in res.invoices if (inv.get("extra") or {}).get("voucher_type_flag")]
+        if flagged:
+            with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(flagged)})"):
+                st.caption(
+                    "Invoices where the VOUCHERNUMBER pattern rule and BILLAMOUNT's sign "
+                    "disagreed on VOUCHERTYPE, or where tax_breakup buckets don't all share "
+                    "BILLAMOUNT's sign. Review before exporting to Tally."
+                )
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "VOUCHERNUMBER": i["VOUCHERNUMBER"],
+                            "VOUCHERTYPE": i["VOUCHERTYPE"],
+                            "BILLAMOUNT": i["BILLAMOUNT"],
+                            "flag": i["extra"]["voucher_type_flag"],
+                        }
+                        for i in flagged
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+
         # Downstream exports need a single voucher_type per run. This layout
-        # mixes Sales and Credit Note in one file (via voucher_type_rule), so
-        # split and offer exports per voucher type found.
+        # mixes Sales and Credit Note (or, on a future Purchase-side sheet,
+        # Purchase and Debit Note) in one file, so split and offer exports
+        # per voucher type found.
         by_type = {}
         for inv in res.invoices:
             by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
@@ -648,13 +714,14 @@ elif layout_choice == "single_sheet_grouped_blocks":
         for vt, invs in by_type.items():
             st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
             # Tally export only has a Sales-shaped and a Purchase-shaped Dr/Cr
-            # engine — a Credit Note runs through the Sales engine (its
-            # amounts are already negative from the sign-flip/parsing step,
-            # so Dr/Cr comes out reversed correctly) but keeps its own label
+            # engine — a reversing voucher runs through the engine of the
+            # type it reverses (its amounts are already negative from the
+            # sign-flip/parsing step, so Dr/Cr comes out flipped correctly —
+            # see tally_export.py's module docstring) but keeps its own label
             # everywhere in the UI via display_label, and key_prefix (unique
             # per vt) keeps its Streamlit widget keys from colliding with
-            # the real Sales bucket's.
-            dispatch_type = vt if vt in ("Sales", "Purchase") else "Sales"
+            # the real Sales/Purchase bucket's.
+            dispatch_type = vt if vt in ("Sales", "Purchase") else _REVERSAL_DISPATCH_TYPE.get(vt, "Sales")
             _render_downstream_exports(
                 invs, dispatch_type,
                 key_prefix=f"gb_{vt.replace(' ', '_')}",
