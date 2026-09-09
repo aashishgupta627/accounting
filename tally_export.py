@@ -5,6 +5,18 @@ Handles both Sales and Purchase vouchers with B2B/B2C classification.
 
 Reads VOUCHERDATE / PARTYSTATECODE from the invoice JSON (renamed from
 DATE / STATECODE — see validate_schema.py's module docstring).
+
+Credit Notes and Debit Notes are NOT a separate code path here. Upstream
+(generic_parser.resolve_voucher_type) a Credit Note is just a Sales
+voucher whose BILLAMOUNT/tax_breakup came through negative, and a Debit
+Note is a Purchase voucher the same way — the sign survives all the way
+from the source file. Every ledger row below is built from a *signed*
+amount via _signed_amount_fields(), which flips the row's Dr/Cr side (and
+always writes a positive magnitude) whenever that signed amount is
+negative. This is the standard Tally convention for a reversing voucher:
+flip Dr<->Cr with positive amounts, not the same side with a negative
+number (most Tally importers don't treat a negative Dr as an implicit
+credit).
 """
 
 from dataclasses import dataclass, field
@@ -64,6 +76,23 @@ def split_state(statecode):
         code, name = s.split("-", 1)
         return code.strip(), name.strip()
     return None, s.strip()
+
+
+def _signed_amount_fields(amount: float, normal_side: str) -> Tuple[float, str]:
+    """Turn a *signed* ledger amount into (magnitude, Dr/Cr side).
+
+    `normal_side` is the side this ledger sits on for an ordinary,
+    positive-amount voucher of this type — e.g. 'Dr' for the party row on
+    a Sales voucher, 'Cr' for the Sales/tax ledgers on that same voucher.
+    A negative `amount` means this row belongs to a reversal (Credit Note
+    on the Sales side, Debit Note on the Purchase side) and flips to the
+    opposite side, using the absolute value as the magnitude. See the
+    module docstring for why this is done per-row from the sign rather
+    than as a separate "is this a Credit Note" branch.
+    """
+    flipped = "Cr" if normal_side == "Dr" else "Dr"
+    side = normal_side if amount >= 0 else flipped
+    return round(abs(amount), 2), side
 
 
 def split_b2b_b2c(invoices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
@@ -246,11 +275,13 @@ def build_sales_voucher_rows(
 
     dr_row = dict(base)
     dr_row["Ledger Name"] = party_name
-    dr_row["Ledger Amount"] = round(bill_amount, 2)
-    dr_row["Ledger Amount Dr/Cr"] = "Dr"
+    dr_amt, dr_side = _signed_amount_fields(bill_amount, "Dr")
+    dr_row["Ledger Amount"] = dr_amt
+    dr_row["Ledger Amount Dr/Cr"] = dr_side
     rows.append(dr_row)
 
-    total_cr = 0.0
+    total_cr = 0.0  # kept as *signed* running total, same arithmetic as before —
+                     # only the row-level magnitude/side (above/below) changed.
 
     for bucket in tax_breakup:
         rate = bucket.get("GSTRATE", 0)
@@ -262,7 +293,11 @@ def build_sales_voucher_rows(
 
         interstate = igst != 0
 
-        if igst > 0 and (cgst > 0 or sgst > 0):
+        # was `igst > 0 and (cgst > 0 or sgst > 0)` -- a Credit Note's
+        # bucket has all three negative, which that comparison would
+        # silently miss. Same class of bug as the interstate = igst != 0
+        # fix elsewhere in this codebase.
+        if igst != 0 and (cgst != 0 or sgst != 0):
             report.gstin_state_mismatches.append({
                 "VOUCHERNUMBER": voucher_no,
                 "GSTRATE": rate,
@@ -276,8 +311,9 @@ def build_sales_voucher_rows(
                     continue
                 r = dict(base)
                 r["Ledger Name"] = ledger_name
-                r["Ledger Amount"] = round(amt, 2)
-                r["Ledger Amount Dr/Cr"] = "Cr"
+                r_amt, r_side = _signed_amount_fields(amt, "Cr")
+                r["Ledger Amount"] = r_amt
+                r["Ledger Amount Dr/Cr"] = r_side
                 if hsn:
                     r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
                     r["HSN/SAC"] = hsn
@@ -288,32 +324,36 @@ def build_sales_voucher_rows(
             if igst:
                 r = dict(base)
                 r["Ledger Name"] = output_tax_ledger_name("IGST", rate)
-                r["Ledger Amount"] = round(igst, 2)
-                r["Ledger Amount Dr/Cr"] = "Cr"
+                r_amt, r_side = _signed_amount_fields(igst, "Cr")
+                r["Ledger Amount"] = r_amt
+                r["Ledger Amount Dr/Cr"] = r_side
                 rows.append(r)
                 total_cr += igst
         else:
             if cgst:
                 r = dict(base)
                 r["Ledger Name"] = output_tax_ledger_name("CGST", rate)
-                r["Ledger Amount"] = round(cgst, 2)
-                r["Ledger Amount Dr/Cr"] = "Cr"
+                r_amt, r_side = _signed_amount_fields(cgst, "Cr")
+                r["Ledger Amount"] = r_amt
+                r["Ledger Amount Dr/Cr"] = r_side
                 rows.append(r)
                 total_cr += cgst
             if sgst:
                 component = "UTGST" if config.home_state_is_ut else "SGST"
                 r = dict(base)
                 r["Ledger Name"] = output_tax_ledger_name(component, rate)
-                r["Ledger Amount"] = round(sgst, 2)
-                r["Ledger Amount Dr/Cr"] = "Cr"
+                r_amt, r_side = _signed_amount_fields(sgst, "Cr")
+                r["Ledger Amount"] = r_amt
+                r["Ledger Amount Dr/Cr"] = r_side
                 rows.append(r)
                 total_cr += sgst
 
         if cess:
             r = dict(base)
             r["Ledger Name"] = "Output CESS"
-            r["Ledger Amount"] = round(cess, 2)
-            r["Ledger Amount Dr/Cr"] = "Cr"
+            r_amt, r_side = _signed_amount_fields(cess, "Cr")
+            r["Ledger Amount"] = r_amt
+            r["Ledger Amount Dr/Cr"] = r_side
             rows.append(r)
             total_cr += cess
 
@@ -421,11 +461,12 @@ def build_purchase_voucher_rows(
 
     cr_row = dict(base)
     cr_row["Ledger Name"] = party_name
-    cr_row["Ledger Amount"] = round(bill_amount, 2)
-    cr_row["Ledger Amount Dr/Cr"] = "Cr"
+    cr_amt, cr_side = _signed_amount_fields(bill_amount, "Cr")
+    cr_row["Ledger Amount"] = cr_amt
+    cr_row["Ledger Amount Dr/Cr"] = cr_side
     rows.append(cr_row)
 
-    total_dr = 0.0
+    total_dr = 0.0  # signed running total, same arithmetic as before
 
     if mode == "B2C":
         for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], bill_amount, rate=None, value_field="AMOUNT"):
@@ -433,8 +474,9 @@ def build_purchase_voucher_rows(
                 continue
             r = dict(base)
             r["Ledger Name"] = ZERO_RATE_PURCHASE_LEDGER
-            r["Ledger Amount"] = round(amt, 2)
-            r["Ledger Amount Dr/Cr"] = "Dr"
+            r_amt, r_side = _signed_amount_fields(amt, "Dr")
+            r["Ledger Amount"] = r_amt
+            r["Ledger Amount Dr/Cr"] = r_side
             if hsn:
                 r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
                 r["HSN/SAC"] = hsn
@@ -451,7 +493,9 @@ def build_purchase_voucher_rows(
 
             interstate = igst != 0
 
-            if igst > 0 and (cgst > 0 or sgst > 0):
+            # was `igst > 0 and (cgst > 0 or sgst > 0)` -- see the same
+            # fix in build_sales_voucher_rows above.
+            if igst != 0 and (cgst != 0 or sgst != 0):
                 report.gstin_state_mismatches.append({
                     "VOUCHERNUMBER": voucher_no,
                     "GSTRATE": rate,
@@ -460,7 +504,10 @@ def build_purchase_voucher_rows(
 
             tax_rates = get_tax_rates(tax_breakup, rate)
 
-            if taxable > 0:
+            # was `if taxable > 0:` -- a Debit Note's bucket has a
+            # negative taxable value, which that comparison would drop
+            # the entire ledger row for instead of writing it out flipped.
+            if taxable != 0:
                 ledger_name = purchase_ledger_name(rate, interstate)
                 for hsn, amt in _hsn_groups_reconciled(invoice.get("items") or [], taxable, rate=rate, value_field="TAXABLEVALUE"):
                     if not amt:
@@ -470,8 +517,9 @@ def build_purchase_voucher_rows(
                     r["IGST Rate"] = tax_rates.get("igst_rate", 0)
                     r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
                     r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
-                    r["Ledger Amount"] = round(amt, 2)
-                    r["Ledger Amount Dr/Cr"] = "Dr"
+                    r_amt, r_side = _signed_amount_fields(amt, "Dr")
+                    r["Ledger Amount"] = r_amt
+                    r["Ledger Amount Dr/Cr"] = r_side
                     if hsn:
                         r["HSN/SAC Details"] = HSN_SAC_DETAILS_FIXED
                         r["HSN/SAC"] = hsn
@@ -483,8 +531,9 @@ def build_purchase_voucher_rows(
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name("IGST", rate)
                     r["IGST Rate"] = tax_rates.get("igst_rate", 0)
-                    r["Ledger Amount"] = round(igst, 2)
-                    r["Ledger Amount Dr/Cr"] = "Dr"
+                    r_amt, r_side = _signed_amount_fields(igst, "Dr")
+                    r["Ledger Amount"] = r_amt
+                    r["Ledger Amount Dr/Cr"] = r_side
                     rows.append(r)
                     total_dr += igst
             else:
@@ -492,8 +541,9 @@ def build_purchase_voucher_rows(
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name("CGST", rate)
                     r["CGST Rate"] = tax_rates.get("cgst_rate", 0)
-                    r["Ledger Amount"] = round(cgst, 2)
-                    r["Ledger Amount Dr/Cr"] = "Dr"
+                    r_amt, r_side = _signed_amount_fields(cgst, "Dr")
+                    r["Ledger Amount"] = r_amt
+                    r["Ledger Amount Dr/Cr"] = r_side
                     rows.append(r)
                     total_dr += cgst
                 if sgst:
@@ -501,16 +551,18 @@ def build_purchase_voucher_rows(
                     r = dict(base)
                     r["Ledger Name"] = input_tax_ledger_name(component, rate)
                     r["SGST/UTGST Rate"] = tax_rates.get("sgst_rate", 0)
-                    r["Ledger Amount"] = round(sgst, 2)
-                    r["Ledger Amount Dr/Cr"] = "Dr"
+                    r_amt, r_side = _signed_amount_fields(sgst, "Dr")
+                    r["Ledger Amount"] = r_amt
+                    r["Ledger Amount Dr/Cr"] = r_side
                     rows.append(r)
                     total_dr += sgst
 
             if cess:
                 r = dict(base)
                 r["Ledger Name"] = "INPUT CESS"
-                r["Ledger Amount"] = round(cess, 2)
-                r["Ledger Amount Dr/Cr"] = "Dr"
+                r_amt, r_side = _signed_amount_fields(cess, "Dr")
+                r["Ledger Amount"] = r_amt
+                r["Ledger Amount Dr/Cr"] = r_side
                 rows.append(r)
                 total_dr += cess
 
