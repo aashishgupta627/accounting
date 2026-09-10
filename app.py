@@ -38,7 +38,15 @@ _REVERSAL_DISPATCH_TYPE = {"Credit Note": "Sales", "Debit Note": "Purchase"}
 # Helper: display Tally export results for a single mode (B2B or B2C)
 # ---------------------------------------------------------------------------
 
-def _display_export_results(result: tuple, mode: str, voucher_type_label: str, key_prefix: str):
+def _display_export_results(result: tuple, mode: str, voucher_type_label: str, key_prefix: str,
+                             reversal_label: str = None):
+    """reversal_label: e.g. 'Credit Note' when this export is a combined
+    Sales + Credit Note run, or 'Debit Note' for Purchase + Debit Note.
+    When given, the reversal-type rows (identified by their own "Voucher
+    Type Name" column -- no separate invoice list needed) are written to
+    both the main sheet (so Tally gets one file to import) *and* a second
+    sheet of the same workbook (so a reviewer can see just the
+    reversals) -- see request point 1."""
     df_out, rpt = result
 
     st.subheader(f"{mode} — {rpt.vouchers_written} voucher(s), {rpt.rows_written} row(s)")
@@ -63,16 +71,35 @@ def _display_export_results(result: tuple, mode: str, voucher_type_label: str, k
 
     if not df_out.empty:
         st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+        reversal_df = None
+        if reversal_label and "Voucher Type Name" in df_out.columns:
+            reversal_df = df_out[df_out["Voucher Type Name"] == reversal_label]
+            if reversal_df.empty:
+                reversal_df = None
+
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df_out.to_excel(writer, sheet_name="Accounting Voucher", index=False)
+            if reversal_df is not None:
+                # Excel sheet names are capped at 31 characters.
+                reversal_df.to_excel(writer, sheet_name=reversal_label[:31], index=False)
+
         st.download_button(
             f"Download {mode} Tally {voucher_type_label} vouchers (.xlsx)",
             data=buf.getvalue(),
-            file_name=f"Tally{voucher_type_label.replace(' ', '')}Vouchers_{mode}.xlsx",
+            file_name=f"Tally{voucher_type_label.replace(' ', '').replace('+', '')}Vouchers_{mode}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"{key_prefix}_dl_{mode}",
         )
+
+        if reversal_df is not None:
+            with st.expander(f"{mode}: {reversal_label} rows only ({len(reversal_df)})"):
+                st.caption(
+                    f"Same rows as in the '{reversal_label}' sheet of the download above — "
+                    f"shown here too for a quick on-screen check."
+                )
+                st.dataframe(reversal_df, use_container_width=True, hide_index=True)
     else:
         st.info(f"No {mode} {voucher_type_label} vouchers to export.")
 
@@ -85,15 +112,22 @@ def _display_export_results(result: tuple, mode: str, voucher_type_label: str, k
 
 def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: str,
                                 home_state_is_ut: bool, round_off_ledger_name: str,
-                                display_label: str = None):
+                                display_label: str = None, reversal_label: str = None):
     """voucher_type: internal dispatch value, must be 'Sales' or 'Purchase'
     (selects which generate_tally_*_export function runs — Tally export
-    only has these two Dr/Cr shapes; a Credit Note dispatches through
-    'Sales' and a Debit Note through 'Purchase' — see
-    _REVERSAL_DISPATCH_TYPE above). display_label: what the user sees in
-    captions/buttons/filenames — lets e.g. Credit Note invoices run through
-    the Sales Dr/Cr engine while still being labelled 'Credit Note'
-    everywhere in the UI. Defaults to voucher_type when not given."""
+    only has these two Dr/Cr shapes). `invoices` is expected to already be
+    the *combined* list for this side (e.g. Sales + Credit Note invoices
+    together) — a Credit/Debit Note doesn't get its own export call, it
+    rides through in the same generate_tally_*_export() run as the
+    voucher type it reverses, since tally_export.py flips Dr/Cr from the
+    signed BILLAMOUNT/tax_breakup values already on each invoice. This is
+    what puts Sales and Credit Note (or Purchase and Debit Note) vouchers
+    into one Tally file, per request point 1.
+
+    display_label: what the user sees in captions/buttons/filenames.
+    reversal_label: e.g. 'Credit Note'/'Debit Note' — passed through to
+    _display_export_results so the reversal-type rows also land on their
+    own sheet in the same workbook."""
     display_label = display_label or voucher_type
 
     st.header("4.5 HSN Summary Reports")
@@ -198,7 +232,10 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
             f"Splits invoices into B2B / B2C (by whether PARTYGSTIN is present), builds "
             f"Tally-importable 'Accounting Voucher' rows for these {display_label} entries. "
             f"Dr: Party, Cr: Sales + Output tax ledgers (flipped for a Credit Note, whose "
-            f"BILLAMOUNT/tax_breakup arrive negative — see tally_export.py's module docstring). "
+            f"BILLAMOUNT/tax_breakup arrive negative). Sales and Credit Note vouchers are "
+            f"written to the same 'Accounting Voucher' sheet for Tally import, with Credit "
+            f"Note rows repeated on their own sheet in the same file for review. "
+            f"B2C rows use a generic 'Customer' ledger name instead of the individual party. "
             f"Only invoices with is_validated = True are exported."
         )
 
@@ -209,7 +246,7 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
         tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
         if tally_results is not None:
             for mode in ("B2B", "B2C"):
-                _display_export_results(tally_results[mode], mode, display_label, key_prefix)
+                _display_export_results(tally_results[mode], mode, display_label, key_prefix, reversal_label=reversal_label)
 
     elif voucher_type == "Purchase":
         st.caption(
@@ -217,7 +254,10 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
             "B2B: Dr = Purchase ledger + Input tax ledgers, Cr = Supplier (full amount). "
             "B2C: Dr = Purchase GST 0% (full amount), Cr = Supplier (full amount). "
             "Flipped for a Debit Note, whose BILLAMOUNT/tax_breakup arrive negative. "
-            "Only invoices with is_validated = True are exported."
+            "Purchase and Debit Note vouchers are written to the same 'Accounting Voucher' "
+            "sheet for Tally import, with Debit Note rows repeated on their own sheet in the "
+            "same file for review. B2C rows use a generic 'Customer' ledger name instead of "
+            "the individual party. Only invoices with is_validated = True are exported."
         )
 
         export_clicked = st.button(f"Prepare Tally {display_label} vouchers", type="primary", key=f"{key_prefix}_prep_tally_purchase_btn")
@@ -227,7 +267,7 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
         tally_results = st.session_state.get(f"{key_prefix}_tally_export_results")
         if tally_results is not None:
             for mode in ("B2B", "B2C"):
-                _display_export_results(tally_results[mode], mode, display_label, key_prefix)
+                _display_export_results(tally_results[mode], mode, display_label, key_prefix, reversal_label=reversal_label)
 
     else:
         st.info(f"Tally export not yet implemented for voucher_type={voucher_type!r}")
@@ -524,12 +564,16 @@ if layout_choice == "two_sheet_joined":
         m4.metric("Reconciled", report.reconciled_invoices)
         m5.metric("Mismatched", report.mismatched_invoices)
 
-        no_items = [inv for inv in res.invoices if inv["is_validated"] is None]
+        no_items = [inv for inv in res.invoices if not inv.get("items")]
         if no_items:
             st.info(
-                f"{len(no_items)} invoice(s) have no matched items (is_validated: null) — "
-                f"e.g. return/credit vouchers recorded in Summary but with no Item Details "
-                f"block of their own. Review below to confirm these are expected, not a gap."
+                f"{len(no_items)} invoice(s) have no matched items — e.g. a 'PR/...' "
+                f"purchase-return row recorded only in the Consolidated Summary sheet. "
+                f"These are still classified via BILLAMOUNT's sign (see the by-type sections "
+                f"below — a negative-total Purchase row now resolves to VOUCHERTYPE = "
+                f"'Debit Note') and validated against the summary row's own tax_breakup "
+                f"instead of being left permanently unvalidated; is_validated is null only "
+                f"if that tax_breakup is also missing. Review below to confirm."
             )
             with st.expander(f"No-items invoices ({len(no_items)})", expanded=False):
                 st.dataframe(
@@ -572,25 +616,50 @@ if layout_choice == "two_sheet_joined":
         with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
             st.json(res.invoices[:5])
 
-        # Downstream exports need a single voucher_type per run, and a
-        # negative-BILLAMOUNT row now resolves to "Credit Note"/"Debit
+        # A negative-BILLAMOUNT row now resolves to "Credit Note"/"Debit
         # Note" (see generic_parser.resolve_voucher_type) rather than the
-        # file's base "Sales"/"Purchase" type -- split and offer exports
-        # per resolved type found, same pattern as single_sheet_grouped_blocks
-        # below.
+        # file's base "Sales"/"Purchase" type. Show each resolved type's
+        # own invoice breakdown separately on the page (request point 2),
+        # but Tally export is combined per side -- Sales + Credit Note
+        # go into one export/file, Purchase + Debit Note into another
+        # (request point 1) -- since dispatch_type below picks the
+        # engine, not a separate invoice list.
         by_type = {}
         for inv in res.invoices:
             by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
 
+        _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
         for vt, invs in by_type.items():
-            st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
-            dispatch_type = vt if vt in ("Sales", "Purchase") else _REVERSAL_DISPATCH_TYPE.get(vt, voucher_type)
+            with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
+                st.dataframe(
+                    pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
+                    use_container_width=True, hide_index=True,
+                )
+
+        sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
+        purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
+        other_types = {vt: invs for vt, invs in by_type.items()
+                       if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
+
+        if sales_side:
+            st.markdown("---")
             _render_downstream_exports(
-                invs, dispatch_type,
-                key_prefix=f"ts_{vt.replace(' ', '_')}",
+                sales_side, "Sales", key_prefix="ts_sales_side",
                 home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label=vt,
+                display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
+                reversal_label="Credit Note",
             )
+        if purchase_side:
+            st.markdown("---")
+            _render_downstream_exports(
+                purchase_side, "Purchase", key_prefix="ts_purchase_side",
+                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
+                reversal_label="Debit Note",
+            )
+        for vt, invs in other_types.items():
+            st.markdown("---")
+            st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
 
 # ===========================================================================
 # SINGLE_SHEET_GROUPED_BLOCKS
@@ -703,31 +772,48 @@ elif layout_choice == "single_sheet_grouped_blocks":
                     use_container_width=True, hide_index=True,
                 )
 
-        # Downstream exports need a single voucher_type per run. This layout
-        # mixes Sales and Credit Note (or, on a future Purchase-side sheet,
-        # Purchase and Debit Note) in one file, so split and offer exports
-        # per voucher type found.
+        # This layout mixes Sales and Credit Note (or, on a future
+        # Purchase-side sheet, Purchase and Debit Note) in one file. Show
+        # each type's own breakdown separately on the page (request point
+        # 2), but combine the Tally export per side -- Sales + Credit
+        # Note into one file, Purchase + Debit Note into another (request
+        # point 1).
         by_type = {}
         for inv in res.invoices:
             by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
 
+        _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
         for vt, invs in by_type.items():
-            st.markdown(f"---\n### {vt} ({len(invs)} invoice(s))")
-            # Tally export only has a Sales-shaped and a Purchase-shaped Dr/Cr
-            # engine — a reversing voucher runs through the engine of the
-            # type it reverses (its amounts are already negative from the
-            # sign-flip/parsing step, so Dr/Cr comes out flipped correctly —
-            # see tally_export.py's module docstring) but keeps its own label
-            # everywhere in the UI via display_label, and key_prefix (unique
-            # per vt) keeps its Streamlit widget keys from colliding with
-            # the real Sales/Purchase bucket's.
-            dispatch_type = vt if vt in ("Sales", "Purchase") else _REVERSAL_DISPATCH_TYPE.get(vt, "Sales")
+            with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
+                st.dataframe(
+                    pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
+                    use_container_width=True, hide_index=True,
+                )
+
+        sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
+        purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
+        other_types = {vt: invs for vt, invs in by_type.items()
+                       if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
+
+        if sales_side:
+            st.markdown("---")
             _render_downstream_exports(
-                invs, dispatch_type,
-                key_prefix=f"gb_{vt.replace(' ', '_')}",
+                sales_side, "Sales", key_prefix="gb_sales_side",
                 home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label=vt,
+                display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
+                reversal_label="Credit Note",
             )
+        if purchase_side:
+            st.markdown("---")
+            _render_downstream_exports(
+                purchase_side, "Purchase", key_prefix="gb_purchase_side",
+                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
+                reversal_label="Debit Note",
+            )
+        for vt, invs in other_types.items():
+            st.markdown("---")
+            st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
 
 # ===========================================================================
 # SINGLE_SHEET_FLAT
