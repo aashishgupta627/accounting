@@ -534,11 +534,36 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
         calculated_sum = sum(_item_net(i) for i in items)
         round_off = row.get("ROUNDOFFAMOUNT") or detail.get("ROUNDOFFAMOUNT") or 0.0
         round_off = safe_float(round_off)
-        adjusted_sum = calculated_sum + round_off
         expected_total = safe_float(row.get("BILLAMOUNT"))
-        is_valid = abs(adjusted_sum - expected_total) <= tolerance
+        tax_breakup = row.get("tax_breakup", [])
 
+        is_valid = None
+        adjusted_sum = None
+        matched_via = None
         if items:
+            adjusted_sum = calculated_sum + round_off
+            is_valid = abs(adjusted_sum - expected_total) <= tolerance
+            matched_via = "items"
+        elif tax_breakup:
+            # No Item Details block for this voucher -- e.g. a "PR/..."
+            # purchase-return row recorded only in the Consolidated
+            # Summary sheet. There's nothing to cross-check against items,
+            # but the summary row still carries its own tax_breakup, so
+            # validate against that instead of leaving is_validated
+            # permanently null. This is what lets a correctly-signed
+            # Debit Note / Credit Note with no item block still be
+            # reconciled and reach the Tally export.
+            tax_breakup_total = sum(
+                (b.get("TAXABLEVALUE") or 0.0) + (b.get("CGSTAMOUNT") or 0.0)
+                + (b.get("SGSTAMOUNT") or 0.0) + (b.get("IGSTAMOUNT") or 0.0)
+                + (b.get("CESSAMOUNT") or 0.0)
+                for b in tax_breakup
+            )
+            adjusted_sum = tax_breakup_total + round_off
+            is_valid = abs(adjusted_sum - expected_total) <= tolerance
+            matched_via = "summary tax_breakup"
+
+        if is_valid is not None:
             if is_valid:
                 report.reconciled_invoices += 1
             else:
@@ -548,6 +573,7 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "expected": expected_total,
                     "calculated": round(adjusted_sum, 2),
                     "difference": round(abs(adjusted_sum - expected_total), 2),
+                    "matched_via": matched_via,
                 })
 
         # A Sales/Purchase file can still contain negative-total rows —
@@ -557,7 +583,6 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
         # columns don't agree with the total (see resolve_voucher_type /
         # _amount_sign_consistent docstrings above).
         resolved_type, type_mismatch = resolve_voucher_type(voucher_type, expected_total)
-        tax_breakup = row.get("tax_breakup", [])
         sign_ok = _amount_sign_consistent(expected_total, tax_breakup)
         if type_mismatch or not sign_ok:
             report.voucher_type_flags.append({
@@ -582,7 +607,7 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
             "tax_breakup": tax_breakup,
             "items": items,
             "items_calculated_total": round(calculated_sum, 2),
-            "is_validated": is_valid if items else None,
+            "is_validated": is_valid,
         }
         if row.get("extra"):
             invoice["extra"] = row["extra"]
