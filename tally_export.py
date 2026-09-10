@@ -32,9 +32,41 @@ class TallyExportConfig:
 
 HSN_SAC_DETAILS_FIXED = "Specify details here"
 
+# Standard CBIC GST state/UT codes -- the first two digits of a GSTIN.
+# Used to derive Buyer/Supplier - State for a B2B party from their GSTIN,
+# independent of whatever PARTYSTATECODE the source file carries.
+GST_STATE_CODES = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam",
+    "19": "West Bengal", "20": "Jharkhand", "21": "Odisha",
+    "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "25": "Daman and Diu", "26": "Dadra and Nagar Haveli",
+    "27": "Maharashtra", "28": "Andhra Pradesh (Old)", "29": "Karnataka",
+    "30": "Goa", "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu",
+    "34": "Puducherry", "35": "Andaman and Nicobar Islands",
+    "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh",
+    "97": "Other Territory", "99": "Centre Jurisdiction",
+}
+
+
+def state_from_gstin(gstin) -> Optional[str]:
+    """First two digits of a GSTIN are the registering state's GST state
+    code. Returns None for anything not shaped like a GSTIN -- this module
+    doesn't assume generic_parser.clean_gstin() has already run, so it
+    re-checks defensively rather than trusting the input."""
+    if not gstin:
+        return None
+    code = str(gstin).strip()[:2]
+    return GST_STATE_CODES.get(code)
+
+
 COMMON_COLUMNS = [
     "Voucher Date", "Reference No.", "Voucher Type Name", "Voucher Number",
     "Buyer/Supplier - Address", "Buyer/Supplier - Pincode",
+    "Buyer/Supplier - State", "Buyer/Supplier - Place of Supply",
     "Ledger Name", "IGST Rate", "CGST Rate", "SGST/UTGST Rate",
     "Ledger Amount", "Ledger Amount Dr/Cr",
     "Item Name", "Billed Quantity", "Item Rate", "Item Rate per",
@@ -131,7 +163,7 @@ def get_tax_rates(tax_breakup: List[Dict], rate: float) -> Dict:
 
 
 def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
-    _, state_name = split_state(invoice.get("PARTYSTATECODE"))
+    _, place_of_supply = split_state(invoice.get("PARTYSTATECODE"))
 
     row = {
         "Voucher Date": invoice.get("VOUCHERDATE"),
@@ -152,20 +184,33 @@ def _base_sales_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict
         "Item Rate per": None,
         "Voucher Narration": None,
         "Change Mode": "Accounting Invoice",
-        "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
         "Buyer/Supplier - Country": config.country,
     }
 
     if mode == "B2B":
+        # State: interpreted from the GSTIN's own state code, not the
+        # invoice's PARTYSTATECODE (a registered party's GSTIN state and
+        # the invoice's ship-to/place-of-supply state can legitimately
+        # differ). Place of Supply: from PARTYSTATECODE, as provided.
+        row["Buyer/Supplier - State"] = state_from_gstin(invoice.get("PARTYGSTIN"))
+        row["Buyer/Supplier - Place of Supply"] = place_of_supply
+        row["Buyer/Supplier - Bill to/from"] = invoice.get("PARTYNAME")
         row[B2B_IDENTITY_COLUMN] = invoice.get("PARTYGSTIN")
     else:
+        # B2C has no GSTIN to interpret a state from, so both State and
+        # Place of Supply come from PARTYSTATECODE, and the individual
+        # customer name is never written out -- a generic "Customer"
+        # label is used instead.
+        row["Buyer/Supplier - State"] = place_of_supply
+        row["Buyer/Supplier - Place of Supply"] = place_of_supply
+        row["Buyer/Supplier - Bill to/from"] = "Customer"
         row[B2C_IDENTITY_COLUMN] = "Unregistered/Consumer"
 
     return row
 
 
 def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> Dict:
-    _, state_name = split_state(invoice.get("PARTYSTATECODE"))
+    _, place_of_supply = split_state(invoice.get("PARTYSTATECODE"))
 
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
     voucher_no = invoice.get("VOUCHERNUMBER")
@@ -190,13 +235,20 @@ def _base_purchase_row(invoice: Dict, mode: str, config: TallyExportConfig) -> D
         "Item Rate per": None,
         "Voucher Narration": None,
         "Change Mode": "Accounting Invoice",
-        "Buyer/Supplier - Bill to/from": invoice.get("PARTYNAME"),
         "Buyer/Supplier - Country": config.country,
     }
 
     if mode == "B2B":
+        # See _base_sales_row's comment: State comes from the GSTIN's own
+        # state code, Place of Supply from PARTYSTATECODE.
+        row["Buyer/Supplier - State"] = state_from_gstin(invoice.get("PARTYGSTIN"))
+        row["Buyer/Supplier - Place of Supply"] = place_of_supply
+        row["Buyer/Supplier - Bill to/from"] = invoice.get("PARTYNAME")
         row[B2B_IDENTITY_COLUMN] = invoice.get("PARTYGSTIN")
     else:
+        row["Buyer/Supplier - State"] = place_of_supply
+        row["Buyer/Supplier - Place of Supply"] = place_of_supply
+        row["Buyer/Supplier - Bill to/from"] = "Customer"
         row[B2C_IDENTITY_COLUMN] = "Unregistered/Consumer"
 
     return row
@@ -271,7 +323,7 @@ def build_sales_voucher_rows(
     rows = []
 
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
-    party_name = invoice.get("PARTYNAME")
+    party_name = "Customer" if mode == "B2C" else invoice.get("PARTYNAME")
 
     dr_row = dict(base)
     dr_row["Ledger Name"] = party_name
@@ -454,7 +506,7 @@ def build_purchase_voucher_rows(
     rows = []
 
     bill_amount = float(invoice.get("BILLAMOUNT") or 0.0)
-    party_name = invoice.get("PARTYNAME")
+    party_name = "Customer" if mode == "B2C" else invoice.get("PARTYNAME")
 
     ref_no = invoice.get("REFERENCENUMBER") or invoice.get("VOUCHERNUMBER")
     ref_date = invoice.get("REFERENCEDATE") or invoice.get("VOUCHERDATE")
