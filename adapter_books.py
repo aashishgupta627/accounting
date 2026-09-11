@@ -45,4 +45,45 @@ def _to_doc(inv: dict) -> CanonicalDoc:
     doc = CanonicalDoc(
         source="books",
         doc_type=doc_type,
-        gstin=normal
+        gstin=normalize_gstin(inv.get("PARTYGSTIN") or ""),
+        party_name=inv.get("PARTYNAME"),
+        doc_no=normalize_doc_no(inv.get("VOUCHERNUMBER")),
+        doc_no_raw=str(inv.get("VOUCHERNUMBER") or ""),
+        doc_date=inv.get("VOUCHERDATE"),
+        pos=inv.get("PARTYSTATECODE"),
+        doc_value=round(float(inv.get("BILLAMOUNT") or 0.0), 2),
+        taxable_value=_sum_breakup(tax_breakup, "TAXABLEVALUE"),
+        igst=_sum_breakup(tax_breakup, "IGSTAMOUNT"),
+        cgst=_sum_breakup(tax_breakup, "CGSTAMOUNT"),
+        sgst=_sum_breakup(tax_breakup, "SGSTAMOUNT"),
+        cess=_sum_breakup(tax_breakup, "CESSAMOUNT"),
+        line_count=len(inv.get("items") or []),
+        extra={"is_validated": inv.get("is_validated")},
+    )
+
+    # Books->portal note-sign convention: portal reports note values as
+    # positive magnitudes; books often keeps them signed negative.
+    if doc.doc_type in _NOTE_TYPES:
+        doc.doc_value = abs(doc.doc_value)
+        doc.taxable_value = abs(doc.taxable_value)
+        doc.igst = abs(doc.igst)
+        doc.cgst = abs(doc.cgst)
+        doc.sgst = abs(doc.sgst)
+        doc.cess = abs(doc.cess)
+
+    return doc
+
+
+def invoices_to_canonical(invoices: Iterable[dict]) -> List[CanonicalDoc]:
+    """Extraction JSON (already CANCEL-filtered) -> list of CanonicalDoc.
+
+    Skips invoices that would be unusable for reconciliation (no GSTIN and
+    no doc number). All other invoices pass through, matching by whatever
+    key they have."""
+    docs = []
+    for inv in invoices:
+        doc = _to_doc(inv)
+        if not doc.gstin and not doc.doc_no:
+            continue
+        docs.append(doc)
+    return docs
