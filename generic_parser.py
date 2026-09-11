@@ -8,6 +8,22 @@ new vendor sharing an already-known layout needs a new mapping, never new
 code here.
 
 No LLM calls happen here. This module is intentionally boring.
+
+EXTRACTION-STAGE SKIP RULE
+--------------------------
+Some books exports contain ledger blocks that are not real counterparties
+— most commonly a Tally 'CANCEL' ledger group with no GSTIN. These rows
+cannot be used downstream (Tally export, HSN summary, GST reconciliation),
+because there is no recipient to attribute them to. They are dropped at
+parse time (both here and in build_invoices for two_sheet_joined), and
+returned separately as a `skipped` list so the caller (orchestrator ->
+app.py) can surface them to the user.
+
+Skip rule: a voucher is skipped iff it has NO resolvable GSTIN AND its
+party name matches a known sentinel ledger name. Both conditions are
+required — a genuine B2C customer with no GSTIN must survive. Sentinel
+set defaults to {"CANCEL"} and is overridable per mapping via the
+optional `skip_party_sentinels` key.
 """
 import re
 import pandas as pd
@@ -20,14 +36,9 @@ NUMERIC_LINE_FIELDS = {
     "IGSTAMOUNT", "CESSAMOUNT",
 }
 
-# Standard 15-character GSTIN shape: 2-digit state code, 10-char PAN,
-# 1 entity code, 1 literal 'Z', 1 checksum char. Some vendor grouped-block
-# exports put a bare state abbreviation (e.g. "PB") in the GSTIN column for
-# unregistered/consumer rows instead of leaving it blank -- that is not a
-# real GSTIN and must not be treated as one (it would wrongly classify a
-# B2C row as B2B downstream). Any value that doesn't match this shape is
-# treated as no-GSTIN.
 _GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$")
+
+DEFAULT_SKIP_PARTY_SENTINELS = {"CANCEL"}
 
 
 def safe_float(value):
@@ -47,8 +58,6 @@ def safe_str(value):
 
 
 def clean_gstin(value):
-    """safe_str, plus rejects anything not shaped like a real GSTIN
-    (see _GSTIN_RE docstring above)."""
     s = safe_str(value)
     if s is None:
         return None
@@ -56,10 +65,6 @@ def clean_gstin(value):
 
 
 def _extract_extra(row, extra_fields: dict) -> dict:
-    """extra_fields: {literal_header_text: col_idx}. Values are captured
-    as-is (best-effort string), never validated against the canonical
-    schema — this is exactly the vendor/domain-specific overflow bucket
-    (BATCHNAME, EXPIRYDATE, FREEQTY, MARGIN%, ...)."""
     if not extra_fields:
         return {}
     out = {}
@@ -69,6 +74,43 @@ def _extract_extra(row, extra_fields: dict) -> dict:
             out[literal_name] = val
     return out
 
+
+# ---------------------------------------------------------------------------
+# Extraction-stage skip rule — see module docstring.
+# ---------------------------------------------------------------------------
+
+def _skip_sentinels_for(mapping: dict) -> set:
+    raw = mapping.get("skip_party_sentinels")
+    if raw is None:
+        return DEFAULT_SKIP_PARTY_SENTINELS
+    return {str(s).strip().upper() for s in raw}
+
+
+def _is_skippable_party(party_name, party_gstin, sentinels: set) -> bool:
+    """Skip iff no GSTIN AND party name is a known sentinel. A real B2C
+    customer (no GSTIN, real name) must survive."""
+    if party_gstin:
+        return False
+    name = (party_name or "").strip().upper()
+    return name in sentinels
+
+
+def _skip_record(doc_type, doc_no, party_name, doc_value, taxable_value,
+                  reason, source_lines=None) -> dict:
+    return {
+        "doc_type": doc_type or "",
+        "doc_no": doc_no or "",
+        "party_name": party_name or "",
+        "doc_value": round(float(doc_value or 0.0), 2),
+        "taxable_value": round(float(taxable_value or 0.0), 2),
+        "reason": reason,
+        "source_lines": source_lines or 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# two_sheet_joined item-side parsing (unchanged except signature note)
+# ---------------------------------------------------------------------------
 
 def parse_item_details(df_raw: pd.DataFrame, mapping: dict) -> dict:
     """Returns {voucher_key: {voucher-level fields..., 'items': [...]}}."""
@@ -230,17 +272,10 @@ def _item_net(item: dict) -> float:
     return item.get("AMOUNT", 0.0)
 
 
-# Voucher-level fields a grouped-blocks row can carry (forward-filled or
-# not) — same pool every other layout draws from, just the subset this
-# report happens to have.
 _GROUPED_VOUCHER_LEVEL_FIELDS = ("PARTYNAME", "PARTYGSTIN", "VOUCHERDATE", "PARTYSTATECODE")
 
 
 def _derive_rate(row, rate_bucket_columns: dict):
-    """rate_bucket_columns: {gst_rate_literal: col_idx}. Each row in this
-    layout resolves to exactly one non-zero rate-bucket column; return that
-    rate. If every bucket is zero/blank, the row's rate is genuinely 0%
-    (not "unknown") -- there's no ambiguity to raise on."""
     if not rate_bucket_columns:
         return None
     for rate, idx in rate_bucket_columns.items():
@@ -251,8 +286,6 @@ def _derive_rate(row, rate_bucket_columns: dict):
 
 
 def _derive_voucher_type(voucher_no: str, rule: dict):
-    """Declarative VOUCHERTYPE-from-VOUCHERNUMBER rule, e.g. {"pattern":
-    "^CRN", "match_value": "Credit Note", "default": "Sales"}."""
     if not rule:
         return None
     pattern = rule.get("pattern")
@@ -261,50 +294,16 @@ def _derive_voucher_type(voucher_no: str, rule: dict):
     return rule.get("default")
 
 
-# ---------------------------------------------------------------------------
-# VOUCHERTYPE sign resolution — shared by every layout.
-#
-# A Credit Note is a Sales voucher with a negative total; a Debit Note is
-# a Purchase voucher with a negative total. Several vendor exports encode
-# this directly (BILLAMOUNT and every tax_breakup bucket come through
-# negative for a return/adjustment row — confirmed against a real
-# GST_Summary_Daily export, where "CRN-" prefixed rows have negative
-# Tot-Amt/Taxable-Amt/tax columns while ordinary "GST-" rows are positive;
-# only the Tot-Qty column is inverted, which sign_flip_fields already
-# corrects). Rather than re-deriving this per layout, one declarative rule
-# is reused everywhere: the mapping's "base" voucher type (Sales/Purchase)
-# plus the sign of BILLAMOUNT is enough on its own, and if a layout *also*
-# has an explicit VOUCHERNUMBER pattern (e.g. "CRN-"), the two signals
-# cross-check each other instead of one silently overriding the other —
-# same "don't let one signal mask a data problem" approach as
-# clean_gstin() and the interstate = igst != 0 fix.
-# ---------------------------------------------------------------------------
-
 _NEGATIVE_VOUCHER_TYPE = {"Sales": "Credit Note", "Purchase": "Debit Note"}
 
 
 def resolve_voucher_type(base_type, amount, pattern_type=None, tolerance=0.01):
-    """Resolve VOUCHERTYPE from up to two independent signals:
-      - pattern_type: derived from VOUCHERNUMBER (e.g. a 'CRN-' prefix ->
-        'Credit Note'), or None if no pattern rule is configured / fired.
-      - sign of `amount` (BILLAMOUNT) relative to `base_type`: a Sales
-        file/voucher with a negative total is a Credit Note; a Purchase
-        file/voucher with a negative total is a Debit Note.
-
-    Returns (voucher_type, mismatch: bool). On mismatch the pattern-derived
-    type wins (a VOUCHERNUMBER prefix is an explicit business convention;
-    a sign disagreement is more likely a data-entry slip), but
-    mismatch=True lets callers surface it as a data-quality flag instead
-    of silently swallowing the disagreement.
-    """
     sign_type = None
     if base_type in _NEGATIVE_VOUCHER_TYPE and amount is not None:
         if amount < -tolerance:
             sign_type = _NEGATIVE_VOUCHER_TYPE[base_type]
         elif amount > tolerance:
             sign_type = base_type
-        # amount ~ 0 -> genuinely ambiguous (e.g. a fully rounded-off
-        # invoice); treat as "no signal" rather than forcing a guess
 
     if pattern_type and sign_type and pattern_type != sign_type:
         return pattern_type, True
@@ -312,11 +311,6 @@ def resolve_voucher_type(base_type, amount, pattern_type=None, tolerance=0.01):
 
 
 def _amount_sign_consistent(amount, tax_breakup, tolerance=0.01):
-    """A Credit/Debit Note should have every tax_breakup bucket negative,
-    not just the BILLAMOUNT total — this catches a partial/mixed-sign
-    data entry error that a total-only sign check would miss. Returns
-    True if consistent (including the trivial case of no buckets or a
-    ~zero amount, where there's nothing meaningful to compare)."""
     if not tax_breakup or amount is None or abs(amount) <= tolerance:
         return True
     expected_negative = amount < 0
@@ -330,10 +324,6 @@ def _amount_sign_consistent(amount, tax_breakup, tolerance=0.01):
 
 
 def _build_tax_breakup(items: list) -> list:
-    """Group an invoice's items by GSTRATE only (never by HSN — items stay
-    one-per-HSN, this is a coarser aggregation used solely for the
-    rate-wise Dr/Cr tax ledgers, same shape parse_summary produces for
-    two_sheet_joined)."""
     buckets = {}
     order = []
     for item in items:
@@ -359,10 +349,6 @@ def _build_tax_breakup(items: list) -> list:
 
 
 def _validate_grouped_invoice(items: list, tolerance: float = 1.0) -> bool:
-    """Per-line taxable+tax vs stated NETAMOUNT consistency check, same
-    tolerance/shape reconcile_grouped_blocks already uses, but returning a
-    single is_validated flag per invoice (needed by tally_export/
-    hsn_summary, which both require is_validated is True)."""
     for item in items:
         taxable = item.get("TAXABLEVALUE") or 0.0
         tax = (
@@ -375,20 +361,17 @@ def _validate_grouped_invoice(items: list, tolerance: float = 1.0) -> bool:
     return True
 
 
-def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
+def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict):
+    """Returns (invoices, skipped). `skipped` lists extraction-stage-drop
+    records — see module docstring (CANCEL ledger blocks, etc.)."""
     col_map = mapping["column_map"]
     extra_fields = mapping.get("extra_fields", {})
     voucher_col = col_map["VOUCHERNUMBER"]
     rate_bucket_columns = mapping.get("rate_bucket_columns", {})
     sign_flip_fields = set(mapping.get("sign_flip_fields", []))
     voucher_type_rule = mapping.get("voucher_type_rule")
-    # Optional: which base voucher type (Sales/Purchase) a *positive*
-    # BILLAMOUNT represents in this file, so the pattern-based VOUCHERTYPE
-    # above can be cross-checked against the sign of the invoice total
-    # once it's known (see resolve_voucher_type). Omit this key on a
-    # mapping to skip the sign cross-check entirely (e.g. a layout with
-    # no returns at all).
     sign_base_type = (voucher_type_rule or {}).get("sign_base_type")
+    sentinels = _skip_sentinels_for(mapping)
 
     invoices = {}
     order = []
@@ -430,6 +413,7 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
         invoices[voucher_no]["items"].append(line)
 
     result = []
+    skipped = []
     for k in order:
         inv = invoices[k]
         items = inv["items"]
@@ -449,9 +433,22 @@ def parse_grouped_blocks(df_filled: pd.DataFrame, mapping: dict) -> list:
                     else "tax_breakup bucket sign inconsistent with BILLAMOUNT"
                 )
 
+        # Extraction-stage skip: no GSTIN AND party-name sentinel (CANCEL).
+        if _is_skippable_party(inv.get("PARTYNAME"), inv.get("PARTYGSTIN"), sentinels):
+            skipped.append(_skip_record(
+                doc_type=inv.get("VOUCHERTYPE"),
+                doc_no=inv.get("VOUCHERNUMBER"),
+                party_name=inv.get("PARTYNAME"),
+                doc_value=inv.get("BILLAMOUNT", 0.0),
+                taxable_value=sum(b.get("TAXABLEVALUE", 0.0) for b in inv.get("tax_breakup", [])),
+                reason=f"party name matches skip sentinel {inv.get('PARTYNAME')!r} and no resolvable GSTIN",
+                source_lines=len(items),
+            ))
+            continue
+
         result.append(inv)
 
-    return result
+    return result, skipped
 
 
 @dataclass
@@ -463,12 +460,6 @@ class GroupedBlocksReport:
 
 
 def reconcile_grouped_blocks(invoices: list, tolerance: float = 1.0) -> GroupedBlocksReport:
-    """Aggregate-level report mirroring _validate_grouped_invoice's
-    per-invoice is_validated check. Compares taxable+tax against NETAMOUNT
-    (falling back to AMOUNT+GSTAMOUNT / AMOUNT via _item_net) rather than
-    AMOUNT directly -- mappings are free to point AMOUNT at the same column
-    as TAXABLEVALUE (as this one does), which would make an AMOUNT-based
-    comparison tautological."""
     report = GroupedBlocksReport(total_invoices=len(invoices))
     for inv in invoices:
         items = inv.get("items", inv.get("lines", []))
@@ -504,14 +495,16 @@ class LayerBReport:
     reconciled_invoices: int = 0
     mismatched_invoices: int = 0
     mismatch_detail: list = field(default_factory=list)
-    # Invoices where VOUCHERTYPE was resolved with a sign/pattern
-    # disagreement, or where tax_breakup bucket signs don't match
-    # BILLAMOUNT's sign — see resolve_voucher_type / _amount_sign_consistent.
     voucher_type_flags: list = field(default_factory=list)
 
 
 def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
-                    tolerance: float = 1.0, voucher_type: str = None):
+                    tolerance: float = 1.0, voucher_type: str = None,
+                    skip_sentinels: set = None):
+    """Returns (invoices, report, skipped). Same extraction-stage skip rule
+    as parse_grouped_blocks: no GSTIN AND party name in sentinels."""
+    sentinels = skip_sentinels if skip_sentinels is not None else DEFAULT_SKIP_PARTY_SENTINELS
+
     detail_keys = list(item_vouchers.keys())
     summary_keys = [r.get("VOUCHERNUMBER") for r in summary_rows if r.get("VOUCHERNUMBER")]
 
@@ -522,6 +515,7 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
     )
 
     invoices = []
+    skipped = []
     for row in summary_rows:
         voucher_no = row.get("VOUCHERNUMBER")
         mapped_key = apply_transform(voucher_no, transform)
@@ -545,14 +539,6 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
             is_valid = abs(adjusted_sum - expected_total) <= tolerance
             matched_via = "items"
         elif tax_breakup:
-            # No Item Details block for this voucher -- e.g. a "PR/..."
-            # purchase-return row recorded only in the Consolidated
-            # Summary sheet. There's nothing to cross-check against items,
-            # but the summary row still carries its own tax_breakup, so
-            # validate against that instead of leaving is_validated
-            # permanently null. This is what lets a correctly-signed
-            # Debit Note / Credit Note with no item block still be
-            # reconciled and reach the Tally export.
             tax_breakup_total = sum(
                 (b.get("TAXABLEVALUE") or 0.0) + (b.get("CGSTAMOUNT") or 0.0)
                 + (b.get("SGSTAMOUNT") or 0.0) + (b.get("IGSTAMOUNT") or 0.0)
@@ -576,12 +562,6 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                     "matched_via": matched_via,
                 })
 
-        # A Sales/Purchase file can still contain negative-total rows —
-        # returns/adjustments recorded inline rather than as a separate
-        # report. Resolve the real VOUCHERTYPE from BILLAMOUNT's sign
-        # relative to the mapping's base type, and flag it if the tax
-        # columns don't agree with the total (see resolve_voucher_type /
-        # _amount_sign_consistent docstrings above).
         resolved_type, type_mismatch = resolve_voucher_type(voucher_type, expected_total)
         sign_ok = _amount_sign_consistent(expected_total, tax_breakup)
         if type_mismatch or not sign_ok:
@@ -593,14 +573,17 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
                 "reason": "pattern/sign disagree" if type_mismatch else "tax_breakup sign inconsistent",
             })
 
+        party_name = row.get("PARTYNAME") or detail.get("PARTYNAME")
+        party_gstin = row.get("PARTYGSTIN") or detail.get("PARTYGSTIN")
+
         invoice = {
             "VOUCHERTYPE": resolved_type,
             "VOUCHERNUMBER": voucher_no,
             "REFERENCENUMBER": row.get("REFERENCENUMBER"),
             "REFERENCEDATE": row.get("REFERENCEDATE"),
             "VOUCHERDATE": row.get("VOUCHERDATE") or detail.get("VOUCHERDATE"),
-            "PARTYNAME": row.get("PARTYNAME") or detail.get("PARTYNAME"),
-            "PARTYGSTIN": row.get("PARTYGSTIN"),
+            "PARTYNAME": party_name,
+            "PARTYGSTIN": party_gstin,
             "PARTYSTATECODE": row.get("PARTYSTATECODE"),
             "BILLAMOUNT": expected_total,
             "ROUNDOFFAMOUNT": round_off,
@@ -611,6 +594,19 @@ def build_invoices(summary_rows: list, item_vouchers: dict, transform: dict,
         }
         if row.get("extra"):
             invoice["extra"] = row["extra"]
+
+        if _is_skippable_party(party_name, party_gstin, sentinels):
+            skipped.append(_skip_record(
+                doc_type=resolved_type,
+                doc_no=voucher_no,
+                party_name=party_name,
+                doc_value=expected_total,
+                taxable_value=sum(b.get("TAXABLEVALUE", 0.0) for b in tax_breakup),
+                reason=f"party name matches skip sentinel {party_name!r} and no resolvable GSTIN",
+                source_lines=len(items),
+            ))
+            continue
+
         invoices.append(invoice)
 
-    return invoices, report
+    return invoices, report, skipped
