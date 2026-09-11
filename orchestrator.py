@@ -1,6 +1,7 @@
 """
 Orchestrator: dispatches a mapping + its file to the right parser, based on
-mapping["layout_type"].
+mapping["layout_type"]. Extraction-stage skip report (CANCEL ledger blocks
+etc.) is captured on RunResult.skipped_invoices.
 """
 import pandas as pd
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from validate_schema import validate_and_decide
 from generic_parser import (
     parse_item_details, parse_summary, build_invoices,
     parse_grouped_blocks, reconcile_grouped_blocks,
-    safe_float, safe_str,
+    safe_float, safe_str, DEFAULT_SKIP_PARTY_SENTINELS,
 )
 
 SUPPORTED_LAYOUTS = {"two_sheet_joined", "single_sheet_grouped_blocks", "single_sheet_flat"}
@@ -23,6 +24,14 @@ class RunResult:
     layer_a_ok: bool
     layer_a_failures: list = field(default_factory=list)
     report: object = None
+    skipped_invoices: list = field(default_factory=list)
+
+
+def _sentinel_override(mapping: dict) -> set:
+    raw = mapping.get("skip_party_sentinels")
+    if raw is None:
+        return DEFAULT_SKIP_PARTY_SENTINELS
+    return {str(s).strip().upper() for s in raw}
 
 
 def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapping, transform):
@@ -38,8 +47,14 @@ def run_two_sheet_joined(item_df_raw, summary_df_raw, item_mapping, summary_mapp
     vouchers = parse_item_details(item_df_raw, item_mapping)
     summary_rows = parse_summary(summary_df_raw, summary_mapping)
     voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
-    invoices, report = build_invoices(summary_rows, vouchers, transform, voucher_type=voucher_type)
-    return RunResult("two_sheet_joined", invoices, True, [], report)
+    sentinels = _sentinel_override(summary_mapping) | _sentinel_override(item_mapping) \
+        if (summary_mapping.get("skip_party_sentinels") or item_mapping.get("skip_party_sentinels")) \
+        else DEFAULT_SKIP_PARTY_SENTINELS
+    invoices, report, skipped = build_invoices(
+        summary_rows, vouchers, transform, voucher_type=voucher_type,
+        skip_sentinels=sentinels,
+    )
+    return RunResult("two_sheet_joined", invoices, True, [], report, skipped)
 
 
 def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mapping, header_row=None):
@@ -51,14 +66,11 @@ def run_single_sheet_grouped_blocks(sheet_df_raw, ingest_mapping, grouped_mappin
     if not ok:
         return RunResult("single_sheet_grouped_blocks", [], False, r.failures)
 
-    invoices = parse_grouped_blocks(filled, grouped_mapping)
+    invoices, skipped = parse_grouped_blocks(filled, grouped_mapping)
     report = reconcile_grouped_blocks(invoices)
-    return RunResult("single_sheet_grouped_blocks", invoices, True, [], report)
+    return RunResult("single_sheet_grouped_blocks", invoices, True, [], report, skipped)
 
 
-# Same NUMERIC set as generic_parser.NUMERIC_LINE_FIELDS — kept local here
-# since this layout (single_sheet_flat) is still untested/unwired into
-# Layer A/B and intentionally standalone.
 _NUMERIC = {
     "ACTUALQTY", "RATE", "GSTRATE", "AMOUNT", "DISCOUNT",
     "TAXABLEVALUE", "GSTAMOUNT", "NETAMOUNT", "CGSTAMOUNT", "SGSTAMOUNT",
