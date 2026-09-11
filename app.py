@@ -1,12 +1,16 @@
 """
 Unified test harness — one app, three layout families, dispatched through
-orchestrator.py exactly the way production would.
+orchestrator.py exactly the way production would, plus a GST Sales
+Reconciliation tab (Books <-> GSTR-1 portal).
 
 Run with: streamlit run app.py
 """
 
 import io
 import json
+import os
+import tempfile
+
 import streamlit as st
 import pandas as pd
 
@@ -20,11 +24,27 @@ from tally_export import (
 )
 from hsn_summary import generate_all_hsn_summaries, HSNValidationReport
 
+# Mappings live here so both app.py and the CLI (run_reconciliation.py)
+# import the same source of truth.
+from app_examples import (
+    EXAMPLES,
+    SALES_TWO_SHEET_EXAMPLE,
+    GST_SUMMARY_DAILY_EXAMPLE,
+)
+
+# GST Sales Reconciliation dependencies.
+from adapter_books import invoices_to_canonical
+from reconcile import reconcile, ReconciliationConfig
+from export_excel import export as export_reconciliation
+import parse_portal_json
+import parse_portal_excel
+
 st.set_page_config(page_title="Invoice extractor — mapping test harness", layout="wide")
 st.title("Invoice extractor — mapping test harness")
 st.caption(
     "One fixed canonical schema, three layout families, per-file mappings pasted in "
-    "(exactly what an LLM detection call would return) until that call is wired in."
+    "(exactly what an LLM detection call would return) until that call is wired in. "
+    "Plus a GST Sales Reconciliation tab (Books ↔ GSTR-1 portal)."
 )
 
 # A reversing voucher (Credit Note / Debit Note) runs through the same
@@ -274,579 +294,608 @@ def _render_downstream_exports(invoices: list, voucher_type: str, key_prefix: st
 
 
 # ---------------------------------------------------------------------------
-# Example mappings for the two real files already validated end-to-end
-# against Sales_July.xlsx and Purchase_July.xlsx (317/317 and 1181/1181
-# invoices reconciled, 0 Dr/Cr balance mismatches on either Tally export),
-# plus GST_Summary_Daily-II_july_2026.xls (single_sheet_grouped_blocks,
-# 550/550 invoices reconciled — 435 Sales + 115 Credit Note, 0 mismatches,
-# totals tie out exactly to the sheet's own Grand Total row: qty +8060,
-# Tot-Amt 10094369.72, Taxable-Amt 8554948.18).
-#
-# SCHEMA NOTE: DATE -> VOUCHERDATE, STATECODE -> PARTYSTATECODE (see
-# validate_schema.py's module docstring). BATCHNAME/EXPIRYDATE/FREEQTY are
-# no longer core item fields — they're captured via extra_fields on both
-# item mappings below, same as MARGIN1/MARGIN2/COST already were.
-#
-# COLUMN-OFFSET FIXES (found by testing against the real files, not just
-# the column-shape samples): Purchase item mapping's DISCOUNT was pointing
-# at "DIS%" (col 13, a percentage) instead of "DIS AMT" (col 14, the real
-# currency amount) — now col 14. MARGIN1/MARGIN2/COST were off by one
-# column (25/26/27, where 25 is actually "CATEGORY") — now 26/27/28. Both
-# mappings' header_row/data_start_row were also pointing above the real
-# 5-row report letterhead in the actual monthly exports — now header_row=5
-# (summary) / header_rows=[4,5], data_start_row=6 (items) for both Sales
-# and Purchase.
-#
-# GST SUMMARY MAPPING NOTES (single_sheet_grouped_blocks):
-#   - block_header_marker uses columns_present=[0] only (not [0,1] — B2C
-#     account blocks have a blank GSTIN cell at the header row, so
-#     requiring col 1 non-blank would drop those blocks). columns_blank
-#     now includes col 5 (Tot-Qty.) alongside col 2 (Date): real account
-#     header rows have it blank, but "Total :" / "Grand Total :" subtotal
-#     rows have col 0 non-blank AND col 2 blank too — col 5 is what
-#     actually distinguishes a header row from a subtotal row here.
-#   - GSTRATE has no dedicated column; it's derived from which of the six
-#     S.(0%)..S.(28%) rate-bucket columns is non-zero per row (confirmed:
-#     exactly one is, on every row) via rate_bucket_columns.
-#   - ACTUALQTY is stored negative for normal sales and positive for
-#     credit notes in this export (inverted vs. accounting convention) —
-#     sign_flip_fields corrects it. Confirmed against the real file: every
-#     other amount column (Tot-Amt/Taxable-Amt/CGST/SGST/IGST/GST-Amt) is
-#     already the sane way round — positive for a normal sale row,
-#     negative for a CRN- row — no flip needed there.
-#   - VOUCHERTYPE is derived from the voucher-number prefix: CRN- ->
-#     "Credit Note", everything else -> "Sales". sign_base_type: "Sales"
-#     cross-checks that against the sign of the invoice's own BILLAMOUNT
-#     once it's computed (see generic_parser.resolve_voucher_type) — on
-#     this file the two signals agree on every row checked.
-#   - AMOUNT is mapped to the same column as TAXABLEVALUE (col 7,
-#     Taxable-Amt.) since this vendor's "Amount" concept for HSN-grouping
-#     purposes is the taxable value, not the tax-inclusive Tot-Amt.
-#     NETAMOUNT carries Tot-Amt. (col 6, tax-inclusive) instead.
-#   - PARTYGSTIN gets sanity-checked against a real GSTIN shape by
-#     generic_parser.clean_gstin() — this file puts a bare state
-#     abbreviation ("PB") in the GSTIN column for B2C rows instead of
-#     leaving it blank; without that check those rows would be
-#     misclassified as B2B.
+# Helper: extraction-stage skip report (CANCEL ledger blocks etc.)
 # ---------------------------------------------------------------------------
 
-EXAMPLES = {
-    "Purchase (two_sheet_joined)": {
-        "layout_type": "two_sheet_joined",
-        "item_mapping": {
-            "sheet_type": "item_details", "header_rows": [4, 5], "data_start_row": 6,
-            "invoice_block_marker": {
-                "column": 0, "pattern": r"[A-Z]{2,4}/\d+",
-                "blob_extract": {
-                    "VOUCHERDATE": r"(?P<v>\d{2}-[A-Za-z]{3}-\d{2})",
-                    "VOUCHERNUMBER": r"(?P<v>[A-Z]{2,4}/\d+)",
-                    "PARTYNAME": r"[A-Z]{2,4}/\d+\s+(?P<v>.+?)\s+User",
-                },
-            },
-            "item_row_column_map": {
-                "STOCKITEMNAME": 2, "ACTUALQTY": 8,
-                "RATE": 10, "GSTRATE": 19, "AMOUNT": 21, "DISCOUNT": 14,
-                "GSTAMOUNT": 22, "HSNCODE": 23,
-            },
-            "extra_fields": {"BATCHNAME": 5, "EXPIRYDATE": 7, "FREEQTY": 9, "MARGIN1": 26, "MARGIN2": 27, "COST": 28},
-            "skip_row_rules": [
-                {"column": 2, "equals_normalized": "TOTAL:"},
-                {"column": 2, "equals_normalized": "GRAND TOTAL:"},
-            ],
-            "confidence": 0.9,
-            "voucher_type": "Purchase",
-        },
-        "summary_mapping": {
-            "sheet_type": "consolidated_summary", "header_row": 5,
-            "voucher_type": "Purchase",
-            "footer_marker": {"column": 0, "equals_normalized": "Total :"},
-            "voucher_number_pattern": r"^[A-Z]{2,4}/\d+$",
-            "column_map": {
-                "VOUCHERDATE": 3, "VOUCHERNUMBER": 1, "PARTYGSTIN": 2, "PARTYNAME": 6,
-                "BILLAMOUNT": 7, "ROUNDOFFAMOUNT": 8, "PARTYSTATECODE": 32,
-                "REFERENCENUMBER": 4, "REFERENCEDATE": 0,
-            },
-            "tax_rate_breakup": [
-                {"GSTRATE": 5, "TAXABLEVALUE": 10, "CGSTAMOUNT": 11, "SGSTAMOUNT": 12, "IGSTAMOUNT": 13},
-                {"GSTRATE": 12, "TAXABLEVALUE": 14, "CGSTAMOUNT": 15, "SGSTAMOUNT": 16, "IGSTAMOUNT": 17},
-                {"GSTRATE": 18, "TAXABLEVALUE": 18, "CGSTAMOUNT": 19, "SGSTAMOUNT": 20, "IGSTAMOUNT": 21},
-                {"GSTRATE": 28, "TAXABLEVALUE": 22, "CGSTAMOUNT": 23, "SGSTAMOUNT": 24, "IGSTAMOUNT": 25},
-                {"GSTRATE": 40, "TAXABLEVALUE": 26, "CGSTAMOUNT": 27, "SGSTAMOUNT": 28, "IGSTAMOUNT": 29},
-                {"GSTRATE": 0, "TAXABLEVALUE": 30},
-            ],
-            "confidence": 0.93,
-        },
-        "transform": {"type": "identity"},
-        "item_sheet_name": "Item Details",
-        "summary_sheet_name": "Consolidated Summary",
-    },
-    "Sales (two_sheet_joined)": {
-        "layout_type": "two_sheet_joined",
-        "item_mapping": {
-            "sheet_type": "item_details", "header_rows": [4, 5], "data_start_row": 6,
-            "invoice_block_marker": {
-                "column": 2, "pattern": r"S0/\d+",
-                "fields": {
-                    "VOUCHERNUMBER": 2, "VOUCHERDATE": 0, "PARTYNAME": 3,
-                    "ROUNDOFFAMOUNT": 15, "BILLAMOUNT": 16,
-                },
-            },
-            "item_row_column_map": {
-                "STOCKITEMNAME": 1, "ACTUALQTY": 8,
-                "GSTRATE": 10, "RATE": 11, "AMOUNT": 12, "DISCOUNT": 13,
-                "TAXABLEVALUE": 14, "NETAMOUNT": 15, "HSNCODE": 17, "GSTAMOUNT": 18,
-            },
-            "extra_fields": {"BATCHNAME": 3, "EXPIRYDATE": 5, "FREEQTY": 9},
-            "skip_row_rules": [],
-            "confidence": 0.92,
-            "voucher_type": "Sales",
-        },
-        "summary_mapping": {
-            "sheet_type": "consolidated_summary", "header_row": 5,
-            "voucher_type": "Sales",
-            "footer_marker": {"column": 0, "equals_normalized": "Total :"},
-            "voucher_number_pattern": r"^S0-\d+-\d+$",
-            "column_map": {
-                "VOUCHERDATE": 0, "VOUCHERNUMBER": 1, "PARTYNAME": 3, "PARTYGSTIN": 4,
-                "BILLAMOUNT": 6, "ROUNDOFFAMOUNT": 7, "PARTYSTATECODE": 32,
-            },
-            "tax_rate_breakup": [
-                {"GSTRATE": 5, "TAXABLEVALUE": 9, "CGSTAMOUNT": 10, "SGSTAMOUNT": 11, "IGSTAMOUNT": 12},
-                {"GSTRATE": 12, "TAXABLEVALUE": 13, "CGSTAMOUNT": 14, "SGSTAMOUNT": 15, "IGSTAMOUNT": 16},
-                {"GSTRATE": 18, "TAXABLEVALUE": 17, "CGSTAMOUNT": 18, "SGSTAMOUNT": 19, "IGSTAMOUNT": 20},
-                {"GSTRATE": 28, "TAXABLEVALUE": 21, "CGSTAMOUNT": 22, "SGSTAMOUNT": 23, "IGSTAMOUNT": 24},
-                {"GSTRATE": 40, "TAXABLEVALUE": 25, "CGSTAMOUNT": 26, "SGSTAMOUNT": 27, "IGSTAMOUNT": 28},
-                {"GSTRATE": 0, "TAXABLEVALUE": 29},
-            ],
-            "confidence": 0.93,
-        },
-        "transform": {"type": "regex_extract", "pattern": r"-(\d+)$", "template": "S0/{1}"},
-        "item_sheet_name": "Item Details",
-        "summary_sheet_name": "Consolidated Summary",
-    },
-    "GST Summary Daily (single_sheet_grouped_blocks)": {
-        "layout_type": "single_sheet_grouped_blocks",
-        "ingest_mapping": {
-            "block_header_marker": {"columns_present": [0], "columns_blank": [2, 5]},
-            "block_footer_marker": {"column": 0, "contains": "Total"},
-            "forward_fill_columns": {"PARTYNAME": 0, "PARTYGSTIN": 1},
-        },
-        "grouped_mapping": {
-            "sheet_type": "single_sheet_grouped_blocks",
-            "line_identifier_field": "HSNCODE",
-            "column_map": {
-                "PARTYNAME": 0, "PARTYGSTIN": 1, "VOUCHERDATE": 2, "VOUCHERNUMBER": 3,
-                "HSNCODE": 4, "ACTUALQTY": 5, "NETAMOUNT": 6,
-                "TAXABLEVALUE": 7, "AMOUNT": 7,
-                "CGSTAMOUNT": 8, "SGSTAMOUNT": 9, "IGSTAMOUNT": 10, "CESSAMOUNT": 11,
-                "GSTAMOUNT": 12,
-            },
-            "rate_bucket_columns": {0: 13, 3: 14, 5: 15, 12: 16, 18: 17, 28: 18},
-            "sign_flip_fields": ["ACTUALQTY"],
-            "voucher_type_rule": {
-                "pattern": "^CRN", "match_value": "Credit Note", "default": "Sales",
-                "sign_base_type": "Sales",
-            },
-            "extra_fields": {"Is-Cash": 27},
-            "confidence": 0.95,
-        },
-        "sheet_name": "ORIGINAL",
-        "header_row": 6,
-    },
-}
-
-with st.sidebar:
-    st.header("1. Input")
-    uploaded = st.file_uploader("Excel file", type=["xlsx", "xls"])
-    layout_choice = st.radio(
-        "Layout family",
-        ["two_sheet_joined", "single_sheet_grouped_blocks", "single_sheet_flat"],
-        help=(
-            "two_sheet_joined: Summary + Item Details sheets joined by a key.\n"
-            "single_sheet_grouped_blocks: one sheet, block-header rows needing forward-fill.\n"
-            "single_sheet_flat: one sheet, one row per line item — untested, no sample file yet."
-        ),
+def _render_skipped_invoices(skipped: list, key_prefix: str):
+    """Extraction-stage skip report: CANCEL ledger blocks etc. that were
+    dropped at parse time so they never reach Tally / HSN / reconciliation.
+    Surfaced here so the user sees exactly what was excluded and why."""
+    if not skipped:
+        return
+    total_value = sum(s.get("doc_value", 0.0) for s in skipped)
+    st.warning(
+        f"⚠️ {len(skipped)} voucher(s) skipped at extraction "
+        f"(total value ₹{total_value:,.2f}). These are excluded from the "
+        f"JSON, Tally export, HSN summary, and any downstream reconciliation."
     )
-    example_choice = st.selectbox("Load example mapping", ["(blank)"] + list(EXAMPLES.keys()))
+    with st.expander(f"Skipped vouchers ({len(skipped)})", expanded=False):
+        st.dataframe(
+            pd.DataFrame(skipped),
+            use_container_width=True, hide_index=True,
+        )
 
-    st.header("2b. Tally export settings")
-    st.caption("Used only by the Tally voucher export section (section 5 below).")
-    home_state_is_ut = st.radio(
-        "Your registered state is a...",
-        ["Union Territory (UTGST)", "State (SGST)"],
-        index=0,
-        help="Controls whether intrastate tax is posted to 'UTGST' or 'SGST' ledgers.",
-    ) == "Union Territory (UTGST)"
-    round_off_ledger_name = st.text_input("Round Off ledger name", value="Round Off")
 
-example = EXAMPLES.get(example_choice)
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
 
-st.header("2. Mapping (paste what an LLM detection call would return)")
+tab_extract, tab_reconcile = st.tabs(["Extraction", "GST Reconciliation (Sales)"])
+
 
 # ===========================================================================
-# TWO_SHEET_JOINED
+# TAB 1 — EXTRACTION (existing behavior preserved)
 # ===========================================================================
-if layout_choice == "two_sheet_joined":
-    item_sheet_name = st.text_input(
-        "Item Details sheet name",
-        value=example["item_sheet_name"] if example and "item_sheet_name" in example else "Item Details",
+
+with tab_extract:
+    with st.sidebar:
+        st.header("1. Input")
+        uploaded = st.file_uploader("Excel file", type=["xlsx", "xls"])
+        layout_choice = st.radio(
+            "Layout family",
+            ["two_sheet_joined", "single_sheet_grouped_blocks", "single_sheet_flat"],
+            help=(
+                "two_sheet_joined: Summary + Item Details sheets joined by a key.\n"
+                "single_sheet_grouped_blocks: one sheet, block-header rows needing forward-fill.\n"
+                "single_sheet_flat: one sheet, one row per line item — untested, no sample file yet."
+            ),
+        )
+        example_choice = st.selectbox("Load example mapping", ["(blank)"] + list(EXAMPLES.keys()))
+
+        st.header("2b. Tally export settings")
+        st.caption("Used only by the Tally voucher export section (section 5 below).")
+        home_state_is_ut = st.radio(
+            "Your registered state is a...",
+            ["Union Territory (UTGST)", "State (SGST)"],
+            index=0,
+            help="Controls whether intrastate tax is posted to 'UTGST' or 'SGST' ledgers.",
+        ) == "Union Territory (UTGST)"
+        round_off_ledger_name = st.text_input("Round Off ledger name", value="Round Off")
+
+    example = EXAMPLES.get(example_choice)
+
+    st.header("2. Mapping (paste what an LLM detection call would return)")
+
+    # =======================================================================
+    # TWO_SHEET_JOINED
+    # =======================================================================
+    if layout_choice == "two_sheet_joined":
+        item_sheet_name = st.text_input(
+            "Item Details sheet name",
+            value=example["item_sheet_name"] if example and "item_sheet_name" in example else "Item Details",
+        )
+        summary_sheet_name = st.text_input(
+            "Consolidated Summary sheet name",
+            value=example["summary_sheet_name"] if example and "summary_sheet_name" in example else "Consolidated Summary",
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            item_text = st.text_area(
+                "Item Details mapping", height=380,
+                value=json.dumps(example["item_mapping"], indent=2) if example and "item_mapping" in example else "{}",
+            )
+        with col2:
+            summary_text = st.text_area(
+                "Consolidated Summary mapping", height=380,
+                value=json.dumps(example["summary_mapping"], indent=2) if example and "summary_mapping" in example else "{}",
+            )
+        with col3:
+            transform_text = st.text_area(
+                "Join transform", height=150,
+                value=json.dumps(example["transform"], indent=2) if example and "transform" in example else '{"type": "identity"}',
+            )
+            st.caption("type: identity | strip_prefix | regex_extract")
+
+        run = st.button("Run", type="primary", disabled=uploaded is None)
+
+        if run and uploaded is not None:
+            try:
+                item_mapping = json.loads(item_text)
+                summary_mapping = json.loads(summary_text)
+                transform = json.loads(transform_text)
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+                st.stop()
+
+            item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
+            summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
+            res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
+            voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
+
+            st.session_state["ts_res"] = res
+            st.session_state["ts_item_df"] = item_df
+            st.session_state["ts_summary_df"] = summary_df
+            st.session_state["ts_item_mapping"] = item_mapping
+            st.session_state["ts_summary_mapping"] = summary_mapping
+            st.session_state["ts_transform"] = transform
+            st.session_state["ts_voucher_type"] = voucher_type
+            st.session_state.pop("ts_hsn_summaries", None)
+            st.session_state.pop("ts_tally_export_results", None)
+
+        # Render from session_state
+        if st.session_state.get("ts_res") is not None:
+            res = st.session_state["ts_res"]
+            item_mapping = st.session_state["ts_item_mapping"]
+            summary_mapping = st.session_state["ts_summary_mapping"]
+            transform = st.session_state["ts_transform"]
+            voucher_type = st.session_state["ts_voucher_type"]
+
+            st.header("3. Layer A")
+            if not res.layer_a_ok:
+                st.error("FAILED")
+                for f in res.layer_a_failures:
+                    st.write(f"- {f}")
+                st.stop()
+            st.success("PASSED")
+
+            # Extraction-stage skip report (CANCEL ledger blocks etc.).
+            _render_skipped_invoices(res.skipped_invoices, "ts")
+
+            report = res.report
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Summary rows", report.total_summary_rows)
+            m2.metric("Join match rate", f"{report.join_match_rate:.1%}")
+            m3.metric("Matched to items", report.matched_invoices)
+            m4.metric("Reconciled", report.reconciled_invoices)
+            m5.metric("Mismatched", report.mismatched_invoices)
+
+            no_items = [inv for inv in res.invoices if not inv.get("items")]
+            if no_items:
+                st.info(
+                    f"{len(no_items)} invoice(s) have no matched items — e.g. a 'PR/...' "
+                    f"purchase-return row recorded only in the Consolidated Summary sheet. "
+                    f"These are still classified via BILLAMOUNT's sign (see the by-type sections "
+                    f"below — a negative-total Purchase row now resolves to VOUCHERTYPE = "
+                    f"'Debit Note') and validated against the summary row's own tax_breakup "
+                    f"instead of being left permanently unvalidated; is_validated is null only "
+                    f"if that tax_breakup is also missing. Review below to confirm."
+                )
+                with st.expander(f"No-items invoices ({len(no_items)})", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame([{"VOUCHERNUMBER": i["VOUCHERNUMBER"], "PARTYNAME": i["PARTYNAME"],
+                                        "BILLAMOUNT": i["BILLAMOUNT"]} for i in no_items]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            if report.join_match_rate < 0.9:
+                st.error("Join match rate below 90% — check the transform JSON.")
+                with st.expander("Debug: sample keys from both sides", expanded=True):
+                    from generic_parser import parse_item_details, parse_summary
+                    item_df = st.session_state["ts_item_df"]
+                    summary_df = st.session_state["ts_summary_df"]
+                    vouchers = parse_item_details(item_df, item_mapping)
+                    summary_rows = parse_summary(summary_df, summary_mapping)
+                    summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
+                    mapped_sample = [{"summary_key": k, "transform_output": apply_transform(k, transform) if k else None}
+                                      for k in summary_sample]
+                    dc1, dc2 = st.columns(2)
+                    dc1.dataframe(pd.DataFrame(mapped_sample), use_container_width=True, hide_index=True)
+                    dc2.write(list(vouchers.keys())[:10])
+
+            if report.mismatch_detail:
+                st.subheader("Mismatched invoices")
+                st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
+
+            if report.voucher_type_flags:
+                with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(report.voucher_type_flags)})"):
+                    st.caption(
+                        "Invoices where the BILLAMOUNT sign disagreed with the expected VOUCHERTYPE, "
+                        "or where tax_breakup buckets don't all share BILLAMOUNT's sign. Review before "
+                        "exporting to Tally — see generic_parser.resolve_voucher_type."
+                    )
+                    st.dataframe(pd.DataFrame(report.voucher_type_flags), use_container_width=True, hide_index=True)
+
+            st.header("4. Result")
+            payload = {
+                "invoices": res.invoices,
+                "_skipped": res.skipped_invoices,
+            }
+            json_str = json.dumps(payload, indent=2, default=str)
+            st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="dl_json")
+            with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
+                st.json(res.invoices[:5])
+
+            by_type = {}
+            for inv in res.invoices:
+                by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
+
+            _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
+            for vt, invs in by_type.items():
+                with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
+            purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
+            other_types = {vt: invs for vt, invs in by_type.items()
+                           if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
+
+            if sales_side:
+                st.markdown("---")
+                _render_downstream_exports(
+                    sales_side, "Sales", key_prefix="ts_sales_side",
+                    home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                    display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
+                    reversal_label="Credit Note",
+                )
+            if purchase_side:
+                st.markdown("---")
+                _render_downstream_exports(
+                    purchase_side, "Purchase", key_prefix="ts_purchase_side",
+                    home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                    display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
+                    reversal_label="Debit Note",
+                )
+            for vt, invs in other_types.items():
+                st.markdown("---")
+                st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
+
+    # =======================================================================
+    # SINGLE_SHEET_GROUPED_BLOCKS
+    # =======================================================================
+    elif layout_choice == "single_sheet_grouped_blocks":
+        sheet_name = st.text_input("Sheet name", value=example["sheet_name"] if example else "ORIGINAL")
+        header_row = st.number_input(
+            "Header row index (0-based)", min_value=0,
+            value=example["header_row"] if example else 0,
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            ingest_text = st.text_area(
+                "Ingestion mapping (block markers + forward-fill columns)", height=300,
+                value=json.dumps(example["ingest_mapping"], indent=2) if example and "ingest_mapping" in example else "{}",
+            )
+            st.caption("block_header_marker / block_footer_marker / forward_fill_columns")
+        with col2:
+            grouped_text = st.text_area(
+                "Grouped-blocks mapping (column_map into the canonical schema)", height=300,
+                value=json.dumps(example["grouped_mapping"], indent=2) if example and "grouped_mapping" in example else "{}",
+            )
+            st.caption(
+                "Optional extras beyond column_map: rate_bucket_columns (derive GSTRATE from "
+                "which rate-bucket column is non-zero), sign_flip_fields (negate a numeric "
+                "field, e.g. when qty sign is inverted vs. accounting convention), "
+                "voucher_type_rule (derive VOUCHERTYPE from a VOUCHERNUMBER pattern, optionally "
+                "cross-checked against BILLAMOUNT's sign via voucher_type_rule.sign_base_type — "
+                "'Sales' or 'Purchase')."
+            )
+
+        run = st.button("Run", type="primary", disabled=uploaded is None)
+
+        if run and uploaded is not None:
+            try:
+                ingest_mapping = json.loads(ingest_text)
+                grouped_mapping = json.loads(grouped_text)
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+                st.stop()
+
+            raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+            res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
+
+            st.session_state["gb_res"] = res
+            st.session_state["gb_voucher_type_rule"] = grouped_mapping.get("voucher_type_rule")
+            st.session_state.pop("gb_hsn_summaries", None)
+            st.session_state.pop("gb_tally_export_results", None)
+
+        if st.session_state.get("gb_res") is not None:
+            res = st.session_state["gb_res"]
+
+            st.header("3. Layer A")
+            if not res.layer_a_ok:
+                st.error("FAILED")
+                for f in res.layer_a_failures:
+                    st.write(f"- {f}")
+                st.stop()
+            st.success("PASSED")
+
+            # Extraction-stage skip report.
+            _render_skipped_invoices(res.skipped_invoices, "gb")
+
+            report = res.report
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Invoices parsed", report.total_invoices)
+            m2.metric("Reconciled", report.reconciled_invoices)
+            m3.metric("Mismatched", report.mismatched_invoices)
+
+            if report.mismatch_detail:
+                st.subheader("Mismatched lines (taxable + tax vs stated amount)")
+                st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
+
+            voucher_types = sorted({inv.get("VOUCHERTYPE") for inv in res.invoices if inv.get("VOUCHERTYPE")})
+            if voucher_types:
+                vt_counts = pd.Series([inv.get("VOUCHERTYPE") for inv in res.invoices]).value_counts()
+                st.caption("Voucher types: " + ", ".join(f"{k} ({v})" for k, v in vt_counts.items()))
+
+            st.header("4. Result")
+            payload = {
+                "invoices": res.invoices,
+                "_skipped": res.skipped_invoices,
+            }
+            json_str = json.dumps(payload, indent=2, default=str)
+            st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="gb_dl_json")
+            with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
+                st.json(res.invoices[:5])
+
+            multi_item = [i for i in res.invoices if len(i.get("items", [])) > 1]
+            if multi_item:
+                with st.expander(f"Multi-HSN invoices ({len(multi_item)} found) — grouping sanity check"):
+                    st.caption(
+                        "Each HSN stays a separate item even when several share the same GST "
+                        "rate within one invoice; tax_breakup aggregates by rate only."
+                    )
+                    st.json(multi_item[:3])
+
+            flagged = [inv for inv in res.invoices if (inv.get("extra") or {}).get("voucher_type_flag")]
+            if flagged:
+                with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(flagged)})"):
+                    st.caption(
+                        "Invoices where the VOUCHERNUMBER pattern rule and BILLAMOUNT's sign "
+                        "disagreed on VOUCHERTYPE, or where tax_breakup buckets don't all share "
+                        "BILLAMOUNT's sign. Review before exporting to Tally."
+                    )
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "VOUCHERNUMBER": i["VOUCHERNUMBER"],
+                                "VOUCHERTYPE": i["VOUCHERTYPE"],
+                                "BILLAMOUNT": i["BILLAMOUNT"],
+                                "flag": i["extra"]["voucher_type_flag"],
+                            }
+                            for i in flagged
+                        ]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            by_type = {}
+            for inv in res.invoices:
+                by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
+
+            _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
+            for vt, invs in by_type.items():
+                with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
+            purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
+            other_types = {vt: invs for vt, invs in by_type.items()
+                           if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
+
+            if sales_side:
+                st.markdown("---")
+                _render_downstream_exports(
+                    sales_side, "Sales", key_prefix="gb_sales_side",
+                    home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                    display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
+                    reversal_label="Credit Note",
+                )
+            if purchase_side:
+                st.markdown("---")
+                _render_downstream_exports(
+                    purchase_side, "Purchase", key_prefix="gb_purchase_side",
+                    home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
+                    display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
+                    reversal_label="Debit Note",
+                )
+            for vt, invs in other_types.items():
+                st.markdown("---")
+                st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
+
+    # =======================================================================
+    # SINGLE_SHEET_FLAT
+    # =======================================================================
+    else:
+        st.info(
+            "No sample file confirms this layout yet. One row = one line item, with "
+            "voucher-level fields (VOUCHERNUMBER, VOUCHERDATE, PARTYNAME, ...) repeated on every "
+            "row belonging to that voucher. The parser (orchestrator.parse_single_sheet_flat) "
+            "is written to the same pattern as the other two layouts but UNTESTED against a "
+            "real export — paste a mapping below once you have a candidate file."
+        )
+        sheet_name = st.text_input("Sheet name", value="Sheet1")
+        data_start_row = st.number_input("Data start row (0-based)", min_value=0, value=1)
+        flat_text = st.text_area(
+            "Flat-sheet mapping", height=300,
+            value=json.dumps({
+                "voucher_fields_column_map": {"VOUCHERNUMBER": 0, "VOUCHERDATE": 1, "PARTYNAME": 2},
+                "item_row_column_map": {"STOCKITEMNAME": 3, "ACTUALQTY": 4, "RATE": 5, "AMOUNT": 6},
+                "line_identifier_field": "STOCKITEMNAME",
+                "data_start_row": 1,
+            }, indent=2),
+        )
+        run = st.button("Run", type="primary", disabled=uploaded is None)
+        if run and uploaded is not None:
+            try:
+                flat_mapping = json.loads(flat_text)
+                flat_mapping["data_start_row"] = data_start_row
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+                st.stop()
+            from orchestrator import parse_single_sheet_flat
+            df_raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
+            invoices = parse_single_sheet_flat(df_raw, flat_mapping)
+            st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
+            st.json(invoices[:5])
+
+
+# ===========================================================================
+# TAB 2 — GST RECONCILIATION (SALES)
+# ===========================================================================
+
+with tab_reconcile:
+    st.header("GST Sales Reconciliation — Books ↔ GSTR-1 Portal")
+    st.caption(
+        "Books side goes through the same extraction pipeline as the Extraction tab, "
+        "using the baked-in example mapping for whichever layout your books file uses. "
+        "CANCEL ledger blocks (no GSTIN) are dropped at extraction time and reported below "
+        "— they never reach the reconciler. Portal side accepts either the GSTR-1 JSON "
+        "(returns_*.json) or the portal's auto-populated Excel export."
     )
-    summary_sheet_name = st.text_input(
-        "Consolidated Summary sheet name",
-        value=example["summary_sheet_name"] if example and "summary_sheet_name" in example else "Consolidated Summary",
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.subheader("Books")
+        books_file = st.file_uploader(
+            "Books export (GST Summary Daily, or Sales two-sheet)",
+            type=["xlsx", "xls"], key="recon_books",
+        )
+        books_layout = st.selectbox(
+            "Books layout",
+            ["single_sheet_grouped_blocks", "two_sheet_joined"],
+            help=(
+                "single_sheet_grouped_blocks: GST Summary Daily (party blocks, "
+                "HSN-grained rows aggregated to invoice level).\n"
+                "two_sheet_joined: Sales_July-style workbook with Item Details + "
+                "Consolidated Summary sheets."
+            ),
+            key="recon_books_layout",
+        )
+    with rc2:
+        st.subheader("Portal")
+        portal_file = st.file_uploader(
+            "GSTR-1 export (JSON or portal auto-populated Excel)",
+            type=["json", "xlsx", "xls"], key="recon_portal",
+        )
+
+    oc1, oc2 = st.columns(2)
+    value_tol = oc1.number_input("Match tolerance (₹)", min_value=0.0, value=1.0, step=0.5, key="recon_val_tol")
+    date_tol = oc2.number_input("Date tolerance (days, fallback matching)", min_value=0, value=3, step=1, key="recon_date_tol")
+
+    run_recon = st.button(
+        "Run reconciliation", type="primary",
+        disabled=(books_file is None or portal_file is None),
+        key="recon_run",
     )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        item_text = st.text_area(
-            "Item Details mapping", height=380,
-            value=json.dumps(example["item_mapping"], indent=2) if example and "item_mapping" in example else "{}",
+    if run_recon and books_file is not None and portal_file is not None:
+        # --- Books -> extraction pipeline -> adapter ---
+        with st.spinner("Parsing books through extraction pipeline…"):
+            if books_layout == "single_sheet_grouped_blocks":
+                ex = GST_SUMMARY_DAILY_EXAMPLE
+                raw = pd.read_excel(books_file, sheet_name=ex["sheet_name"], header=None)
+                res = run_single_sheet_grouped_blocks(
+                    raw, ex["ingest_mapping"], ex["grouped_mapping"], header_row=ex["header_row"],
+                )
+            else:
+                ex = SALES_TWO_SHEET_EXAMPLE
+                item_df = pd.read_excel(books_file, sheet_name=ex["item_sheet_name"], header=None)
+                summary_df = pd.read_excel(books_file, sheet_name=ex["summary_sheet_name"], header=None)
+                res = run_two_sheet_joined(
+                    item_df, summary_df,
+                    ex["item_mapping"], ex["summary_mapping"], ex["transform"],
+                )
+
+            if not res.layer_a_ok:
+                st.error("Books Layer A validation failed:")
+                for f in res.layer_a_failures:
+                    st.write(f"- {f}")
+                st.stop()
+
+            books_docs = invoices_to_canonical(res.invoices)
+
+        # --- Portal -> JSON or Excel ---
+        with st.spinner("Parsing portal export…"):
+            ext = os.path.splitext(portal_file.name)[1].lower()
+            if ext == ".json":
+                with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+                    tf.write(portal_file.getvalue())
+                    tmp_path = tf.name
+                portal_docs, b2c_totals, meta = parse_portal_json.parse_all(tmp_path)
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+                    tf.write(portal_file.getvalue())
+                    tmp_path = tf.name
+                portal_docs, b2c_totals, meta = parse_portal_excel.parse_all(tmp_path)
+
+        config = ReconciliationConfig(
+            value_tolerance=float(value_tol),
+            date_tolerance_days=int(date_tol),
         )
-    with col2:
-        summary_text = st.text_area(
-            "Consolidated Summary mapping", height=380,
-            value=json.dumps(example["summary_mapping"], indent=2) if example and "summary_mapping" in example else "{}",
-        )
-    with col3:
-        transform_text = st.text_area(
-            "Join transform", height=150,
-            value=json.dumps(example["transform"], indent=2) if example and "transform" in example else '{"type": "identity"}',
-        )
-        st.caption("type: identity | strip_prefix | regex_extract")
+        result = reconcile(books_docs, portal_docs, config)
 
-    run = st.button("Run", type="primary", disabled=uploaded is None)
+        # Persist for re-render on any subsequent widget interaction.
+        st.session_state["recon_result"] = result
+        st.session_state["recon_config"] = config
+        st.session_state["recon_meta"] = meta
+        st.session_state["recon_b2c"] = b2c_totals
+        st.session_state["recon_books_skipped"] = res.skipped_invoices
 
-    if run and uploaded is not None:
-        try:
-            item_mapping = json.loads(item_text)
-            summary_mapping = json.loads(summary_text)
-            transform = json.loads(transform_text)
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON: {e}")
-            st.stop()
+    # --- Render (from session_state, so download button survives re-runs) ---
+    if st.session_state.get("recon_result") is not None:
+        result = st.session_state["recon_result"]
+        config = st.session_state["recon_config"]
+        meta = st.session_state["recon_meta"]
+        b2c = st.session_state["recon_b2c"]
+        skipped = st.session_state.get("recon_books_skipped", [])
 
-        item_df = pd.read_excel(uploaded, sheet_name=item_sheet_name, header=None)
-        summary_df = pd.read_excel(uploaded, sheet_name=summary_sheet_name, header=None)
-        res = run_two_sheet_joined(item_df, summary_df, item_mapping, summary_mapping, transform)
-        voucher_type = summary_mapping.get("voucher_type") or item_mapping.get("voucher_type")
+        st.markdown("---")
+        st.subheader("Books-side extraction skips")
+        _render_skipped_invoices(skipped, "recon")
 
-        st.session_state["ts_res"] = res
-        st.session_state["ts_item_df"] = item_df
-        st.session_state["ts_summary_df"] = summary_df
-        st.session_state["ts_item_mapping"] = item_mapping
-        st.session_state["ts_summary_mapping"] = summary_mapping
-        st.session_state["ts_transform"] = transform
-        st.session_state["ts_voucher_type"] = voucher_type
-        st.session_state.pop("ts_hsn_summaries", None)
-        st.session_state.pop("ts_tally_export_results", None)
+        st.subheader("Reconciliation summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Exact Match", len(result["exact_match"]))
+        c2.metric("Partial Match", len(result["partial_match"]))
+        c3.metric("Books Only", len(result["books_only"]))
+        c4.metric("Portal Only", len(result["portal_only"]))
 
-    # Render from session_state
-    if st.session_state.get("ts_res") is not None:
-        res = st.session_state["ts_res"]
-        item_mapping = st.session_state["ts_item_mapping"]
-        summary_mapping = st.session_state["ts_summary_mapping"]
-        transform = st.session_state["ts_transform"]
-        voucher_type = st.session_state["ts_voucher_type"]
+        def _sum_val(rows, side):
+            return sum(getattr(r, side).doc_value for r in rows if getattr(r, side))
 
-        st.header("3. Layer A")
-        if not res.layer_a_ok:
-            st.error("FAILED")
-            for f in res.layer_a_failures:
-                st.write(f"- {f}")
-            st.stop()
-        st.success("PASSED")
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Exact Match ₹", f"₹{_sum_val(result['exact_match'], 'books_doc'):,.2f}")
+        v2.metric("Partial Match ₹", f"₹{_sum_val(result['partial_match'], 'books_doc'):,.2f}")
+        v3.metric("Books Only ₹", f"₹{_sum_val(result['books_only'], 'books_doc'):,.2f}")
+        v4.metric("Portal Only ₹", f"₹{_sum_val(result['portal_only'], 'portal_doc'):,.2f}")
 
-        report = res.report
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Summary rows", report.total_summary_rows)
-        m2.metric("Join match rate", f"{report.join_match_rate:.1%}")
-        m3.metric("Matched to items", report.matched_invoices)
-        m4.metric("Reconciled", report.reconciled_invoices)
-        m5.metric("Mismatched", report.mismatched_invoices)
-
-        no_items = [inv for inv in res.invoices if not inv.get("items")]
-        if no_items:
+        if meta:
+            st.caption(
+                f"Portal meta — GSTIN: {meta.get('gstin') or '—'} | "
+                f"Period: {meta.get('period') or '—'} | "
+                f"Filing type: {meta.get('filing_type') or '—'}"
+            )
+        if b2c:
             st.info(
-                f"{len(no_items)} invoice(s) have no matched items — e.g. a 'PR/...' "
-                f"purchase-return row recorded only in the Consolidated Summary sheet. "
-                f"These are still classified via BILLAMOUNT's sign (see the by-type sections "
-                f"below — a negative-total Purchase row now resolves to VOUCHERTYPE = "
-                f"'Debit Note') and validated against the summary row's own tax_breakup "
-                f"instead of being left permanently unvalidated; is_validated is null only "
-                f"if that tax_breakup is also missing. Review below to confirm."
+                f"Portal B2C totals (aggregate only, informational): "
+                f"Taxable ₹{b2c.get('taxable_value', 0):,.2f} | "
+                f"IGST ₹{b2c.get('igst', 0):,.2f} | "
+                f"CGST ₹{b2c.get('cgst', 0):,.2f} | "
+                f"SGST ₹{b2c.get('sgst', 0):,.2f} | "
+                f"CESS ₹{b2c.get('cess', 0):,.2f}"
             )
-            with st.expander(f"No-items invoices ({len(no_items)})", expanded=False):
-                st.dataframe(
-                    pd.DataFrame([{"VOUCHERNUMBER": i["VOUCHERNUMBER"], "PARTYNAME": i["PARTYNAME"],
-                                    "BILLAMOUNT": i["BILLAMOUNT"]} for i in no_items]),
-                    use_container_width=True, hide_index=True,
-                )
 
-        if report.join_match_rate < 0.9:
-            st.error("Join match rate below 90% — check the transform JSON.")
-            with st.expander("Debug: sample keys from both sides", expanded=True):
-                from generic_parser import parse_item_details, parse_summary
-                item_df = st.session_state["ts_item_df"]
-                summary_df = st.session_state["ts_summary_df"]
-                vouchers = parse_item_details(item_df, item_mapping)
-                summary_rows = parse_summary(summary_df, summary_mapping)
-                summary_sample = [r.get("VOUCHERNUMBER") for r in summary_rows[:10]]
-                mapped_sample = [{"summary_key": k, "transform_output": apply_transform(k, transform) if k else None}
-                                  for k in summary_sample]
-                dc1, dc2 = st.columns(2)
-                dc1.dataframe(pd.DataFrame(mapped_sample), use_container_width=True, hide_index=True)
-                dc2.write(list(vouchers.keys())[:10])
+        if result["partial_match"]:
+            with st.expander(f"Partial Match detail ({len(result['partial_match'])})"):
+                st.dataframe(pd.DataFrame([
+                    {
+                        "Books Doc No": r.books_doc.doc_no_raw if r.books_doc else "",
+                        "Portal Doc No": r.portal_doc.doc_no_raw if r.portal_doc else "",
+                        "GSTIN": (r.books_doc or r.portal_doc).gstin,
+                        "Fields": ", ".join(m["field"] for m in r.mismatch_fields),
+                        "Note": r.mismatch_note,
+                    }
+                    for r in result["partial_match"]
+                ]), use_container_width=True, hide_index=True)
 
-        if report.mismatch_detail:
-            st.subheader("Mismatched invoices")
-            st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
+        # Build the workbook in a temp path, then read into memory for the
+        # download button (openpyxl writes to a path, not a file-like).
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+            tmp_out = tf.name
+        export_reconciliation(result, config, tmp_out, meta=meta)
+        with open(tmp_out, "rb") as fh:
+            buf = io.BytesIO(fh.read())
 
-        if report.voucher_type_flags:
-            with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(report.voucher_type_flags)})"):
-                st.caption(
-                    "Invoices where the BILLAMOUNT sign disagreed with the expected VOUCHERTYPE, "
-                    "or where tax_breakup buckets don't all share BILLAMOUNT's sign. Review before "
-                    "exporting to Tally — see generic_parser.resolve_voucher_type."
-                )
-                st.dataframe(pd.DataFrame(report.voucher_type_flags), use_container_width=True, hide_index=True)
-
-        st.header("4. Result")
-        json_str = json.dumps(res.invoices, indent=2, default=str)
-        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="dl_json")
-        with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
-            st.json(res.invoices[:5])
-
-        # A negative-BILLAMOUNT row now resolves to "Credit Note"/"Debit
-        # Note" (see generic_parser.resolve_voucher_type) rather than the
-        # file's base "Sales"/"Purchase" type. Show each resolved type's
-        # own invoice breakdown separately on the page (request point 2),
-        # but Tally export is combined per side -- Sales + Credit Note
-        # go into one export/file, Purchase + Debit Note into another
-        # (request point 1) -- since dispatch_type below picks the
-        # engine, not a separate invoice list.
-        by_type = {}
-        for inv in res.invoices:
-            by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
-
-        _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
-        for vt, invs in by_type.items():
-            with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
-                st.dataframe(
-                    pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
-                    use_container_width=True, hide_index=True,
-                )
-
-        sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
-        purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
-        other_types = {vt: invs for vt, invs in by_type.items()
-                       if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
-
-        if sales_side:
-            st.markdown("---")
-            _render_downstream_exports(
-                sales_side, "Sales", key_prefix="ts_sales_side",
-                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
-                reversal_label="Credit Note",
-            )
-        if purchase_side:
-            st.markdown("---")
-            _render_downstream_exports(
-                purchase_side, "Purchase", key_prefix="ts_purchase_side",
-                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
-                reversal_label="Debit Note",
-            )
-        for vt, invs in other_types.items():
-            st.markdown("---")
-            st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
-
-# ===========================================================================
-# SINGLE_SHEET_GROUPED_BLOCKS
-# ===========================================================================
-elif layout_choice == "single_sheet_grouped_blocks":
-    sheet_name = st.text_input("Sheet name", value=example["sheet_name"] if example else "ORIGINAL")
-    header_row = st.number_input(
-        "Header row index (0-based)", min_value=0,
-        value=example["header_row"] if example else 0,
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        ingest_text = st.text_area(
-            "Ingestion mapping (block markers + forward-fill columns)", height=300,
-            value=json.dumps(example["ingest_mapping"], indent=2) if example and "ingest_mapping" in example else "{}",
+        st.download_button(
+            "Download reconciliation workbook (.xlsx)",
+            data=buf.getvalue(),
+            file_name="gst_sales_reconciliation.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="recon_dl",
         )
-        st.caption("block_header_marker / block_footer_marker / forward_fill_columns")
-    with col2:
-        grouped_text = st.text_area(
-            "Grouped-blocks mapping (column_map into the canonical schema)", height=300,
-            value=json.dumps(example["grouped_mapping"], indent=2) if example and "grouped_mapping" in example else "{}",
-        )
-        st.caption(
-            "Optional extras beyond column_map: rate_bucket_columns (derive GSTRATE from "
-            "which rate-bucket column is non-zero), sign_flip_fields (negate a numeric "
-            "field, e.g. when qty sign is inverted vs. accounting convention), "
-            "voucher_type_rule (derive VOUCHERTYPE from a VOUCHERNUMBER pattern, optionally "
-            "cross-checked against BILLAMOUNT's sign via voucher_type_rule.sign_base_type — "
-            "'Sales' or 'Purchase')."
-        )
-
-    run = st.button("Run", type="primary", disabled=uploaded is None)
-
-    if run and uploaded is not None:
-        try:
-            ingest_mapping = json.loads(ingest_text)
-            grouped_mapping = json.loads(grouped_text)
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON: {e}")
-            st.stop()
-
-        raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
-        res = run_single_sheet_grouped_blocks(raw, ingest_mapping, grouped_mapping, header_row=header_row)
-
-        st.session_state["gb_res"] = res
-        st.session_state["gb_voucher_type_rule"] = grouped_mapping.get("voucher_type_rule")
-        st.session_state.pop("gb_hsn_summaries", None)
-        st.session_state.pop("gb_tally_export_results", None)
-
-    if st.session_state.get("gb_res") is not None:
-        res = st.session_state["gb_res"]
-
-        st.header("3. Layer A")
-        if not res.layer_a_ok:
-            st.error("FAILED")
-            for f in res.layer_a_failures:
-                st.write(f"- {f}")
-            st.stop()
-        st.success("PASSED")
-
-        report = res.report
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Invoices parsed", report.total_invoices)
-        m2.metric("Reconciled", report.reconciled_invoices)
-        m3.metric("Mismatched", report.mismatched_invoices)
-
-        if report.mismatch_detail:
-            st.subheader("Mismatched lines (taxable + tax vs stated amount)")
-            st.dataframe(pd.DataFrame(report.mismatch_detail), use_container_width=True, hide_index=True)
-
-        voucher_types = sorted({inv.get("VOUCHERTYPE") for inv in res.invoices if inv.get("VOUCHERTYPE")})
-        if voucher_types:
-            vt_counts = pd.Series([inv.get("VOUCHERTYPE") for inv in res.invoices]).value_counts()
-            st.caption("Voucher types: " + ", ".join(f"{k} ({v})" for k, v in vt_counts.items()))
-
-        st.header("4. Result")
-        json_str = json.dumps(res.invoices, indent=2, default=str)
-        st.download_button("Download JSON", data=json_str, file_name="invoices.json", mime="application/json", key="gb_dl_json")
-        with st.expander(f"Preview ({min(5, len(res.invoices))} of {len(res.invoices)})"):
-            st.json(res.invoices[:5])
-
-        multi_item = [i for i in res.invoices if len(i.get("items", [])) > 1]
-        if multi_item:
-            with st.expander(f"Multi-HSN invoices ({len(multi_item)} found) — grouping sanity check"):
-                st.caption(
-                    "Each HSN stays a separate item even when several share the same GST "
-                    "rate within one invoice; tax_breakup aggregates by rate only."
-                )
-                st.json(multi_item[:3])
-
-        flagged = [inv for inv in res.invoices if (inv.get("extra") or {}).get("voucher_type_flag")]
-        if flagged:
-            with st.expander(f"⚠️ VOUCHERTYPE sign/pattern flags ({len(flagged)})"):
-                st.caption(
-                    "Invoices where the VOUCHERNUMBER pattern rule and BILLAMOUNT's sign "
-                    "disagreed on VOUCHERTYPE, or where tax_breakup buckets don't all share "
-                    "BILLAMOUNT's sign. Review before exporting to Tally."
-                )
-                st.dataframe(
-                    pd.DataFrame([
-                        {
-                            "VOUCHERNUMBER": i["VOUCHERNUMBER"],
-                            "VOUCHERTYPE": i["VOUCHERTYPE"],
-                            "BILLAMOUNT": i["BILLAMOUNT"],
-                            "flag": i["extra"]["voucher_type_flag"],
-                        }
-                        for i in flagged
-                    ]),
-                    use_container_width=True, hide_index=True,
-                )
-
-        # This layout mixes Sales and Credit Note (or, on a future
-        # Purchase-side sheet, Purchase and Debit Note) in one file. Show
-        # each type's own breakdown separately on the page (request point
-        # 2), but combine the Tally export per side -- Sales + Credit
-        # Note into one file, Purchase + Debit Note into another (request
-        # point 1).
-        by_type = {}
-        for inv in res.invoices:
-            by_type.setdefault(inv.get("VOUCHERTYPE") or "Unknown", []).append(inv)
-
-        _PREVIEW_COLS = ["VOUCHERNUMBER", "PARTYNAME", "BILLAMOUNT", "is_validated"]
-        for vt, invs in by_type.items():
-            with st.expander(f"{vt} — {len(invs)} invoice(s)", expanded=False):
-                st.dataframe(
-                    pd.DataFrame([{c: inv.get(c) for c in _PREVIEW_COLS} for inv in invs]),
-                    use_container_width=True, hide_index=True,
-                )
-
-        sales_side = by_type.get("Sales", []) + by_type.get("Credit Note", [])
-        purchase_side = by_type.get("Purchase", []) + by_type.get("Debit Note", [])
-        other_types = {vt: invs for vt, invs in by_type.items()
-                       if vt not in ("Sales", "Credit Note", "Purchase", "Debit Note")}
-
-        if sales_side:
-            st.markdown("---")
-            _render_downstream_exports(
-                sales_side, "Sales", key_prefix="gb_sales_side",
-                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label="Sales" + (" + Credit Note" if by_type.get("Credit Note") else ""),
-                reversal_label="Credit Note",
-            )
-        if purchase_side:
-            st.markdown("---")
-            _render_downstream_exports(
-                purchase_side, "Purchase", key_prefix="gb_purchase_side",
-                home_state_is_ut=home_state_is_ut, round_off_ledger_name=round_off_ledger_name,
-                display_label="Purchase" + (" + Debit Note" if by_type.get("Debit Note") else ""),
-                reversal_label="Debit Note",
-            )
-        for vt, invs in other_types.items():
-            st.markdown("---")
-            st.info(f"VOUCHERTYPE {vt!r} ({len(invs)} invoice(s)) has no matching Tally export engine.")
-
-# ===========================================================================
-# SINGLE_SHEET_FLAT
-# ===========================================================================
-else:
-    st.info(
-        "No sample file confirms this layout yet. One row = one line item, with "
-        "voucher-level fields (VOUCHERNUMBER, VOUCHERDATE, PARTYNAME, ...) repeated on every "
-        "row belonging to that voucher. The parser (orchestrator.parse_single_sheet_flat) "
-        "is written to the same pattern as the other two layouts but UNTESTED against a "
-        "real export — paste a mapping below once you have a candidate file."
-    )
-    sheet_name = st.text_input("Sheet name", value="Sheet1")
-    data_start_row = st.number_input("Data start row (0-based)", min_value=0, value=1)
-    flat_text = st.text_area(
-        "Flat-sheet mapping", height=300,
-        value=json.dumps({
-            "voucher_fields_column_map": {"VOUCHERNUMBER": 0, "VOUCHERDATE": 1, "PARTYNAME": 2},
-            "item_row_column_map": {"STOCKITEMNAME": 3, "ACTUALQTY": 4, "RATE": 5, "AMOUNT": 6},
-            "line_identifier_field": "STOCKITEMNAME",
-            "data_start_row": 1,
-        }, indent=2),
-    )
-    run = st.button("Run", type="primary", disabled=uploaded is None)
-    if run and uploaded is not None:
-        try:
-            flat_mapping = json.loads(flat_text)
-            flat_mapping["data_start_row"] = data_start_row
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON: {e}")
-            st.stop()
-        from orchestrator import parse_single_sheet_flat
-        df_raw = pd.read_excel(uploaded, sheet_name=sheet_name, header=None)
-        invoices = parse_single_sheet_flat(df_raw, flat_mapping)
-        st.write(f"{len(invoices)} invoices parsed (no Layer A/B wired in yet for this layout)")
-        st.json(invoices[:5])
